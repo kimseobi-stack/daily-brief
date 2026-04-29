@@ -152,29 +152,79 @@ def fetch_news():
 # =============================================================================
 # 3. 멀티 AI 호출 (해설만, 숫자 생성 금지)
 # =============================================================================
-def call_gemini(prompt, model="gemini-flash-latest"):
+def call_gemini(prompt, model="gemini-flash-latest", temperature=0.3):
+    """Gemini 호출. status_code 체크 + 길이 검증 + 상세 에러 로깅."""
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
         r = requests.post(url, json={
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 2500, "temperature": 0.3}
+            "generationConfig": {"maxOutputTokens": 2500, "temperature": temperature}
         }, timeout=60)
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        if r.status_code != 200:
+            return f"[ERROR Gemini {model} HTTP {r.status_code}: {r.text[:300]}]"
+        d = r.json()
+        if "candidates" not in d or not d["candidates"]:
+            return f"[ERROR Gemini {model} no candidates: {str(d)[:300]}]"
+        text = d["candidates"][0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        if len(text) < 100:
+            return f"[ERROR Gemini {model} too short ({len(text)}자): {text}]"
+        return text
     except Exception as e:
-        return f"[ERROR Gemini: {e}]"
+        return f"[ERROR Gemini {model} exception: {type(e).__name__}: {e}]"
 
 
 def call_openrouter(prompt, model):
+    """OpenRouter 호출. status_code 체크 + 길이 검증 + 상세 에러 로깅."""
     try:
         r = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/kimseobi-stack/daily-brief",
+                "X-Title": "Daily Brief",
+            },
             json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 2500},
-            timeout=90
+            timeout=120
         )
-        return r.json()["choices"][0]["message"]["content"]
+        if r.status_code != 200:
+            return f"[ERROR OpenRouter {model} HTTP {r.status_code}: {r.text[:300]}]"
+        d = r.json()
+        if "choices" not in d or not d["choices"]:
+            return f"[ERROR OpenRouter {model} no choices: {str(d)[:300]}]"
+        text = d["choices"][0].get("message", {}).get("content", "")
+        if len(text) < 100:
+            return f"[ERROR OpenRouter {model} too short ({len(text)}자): {text}]"
+        return text
     except Exception as e:
-        return f"[ERROR {model}: {e}]"
+        return f"[ERROR OpenRouter {model} exception: {type(e).__name__}: {e}]"
+
+
+def call_ai_with_fallback(prompt, slot):
+    """AI 호출 + 실패 시 Gemini 다른 모델/temperature로 fallback.
+    slot: 'AI1' Gemini 2.0 Flash, 'AI2' OpenRouter GPT-OSS, 'AI3' OpenRouter Qwen3
+    """
+    if slot == "AI1":
+        out = call_gemini(prompt, "gemini-2.0-flash", temperature=0.3)
+        if out.startswith("[ERROR"):
+            print(f"  {slot} 1차 실패: {out[:100]}")
+            out = call_gemini(prompt, "gemini-flash-latest", temperature=0.3)
+        return out
+    elif slot == "AI2":
+        out = call_openrouter(prompt, "openai/gpt-oss-120b:free")
+        if out.startswith("[ERROR"):
+            print(f"  {slot} OpenRouter 실패, Gemini fallback: {out[:120]}")
+            out = call_gemini(prompt + "\n\n[지시: 보수적/위험 회피 관점에서 분석]",
+                              "gemini-flash-latest", temperature=0.5)
+        return out
+    elif slot == "AI3":
+        out = call_openrouter(prompt, "qwen/qwen3-next-80b-a3b-instruct:free")
+        if out.startswith("[ERROR"):
+            print(f"  {slot} OpenRouter 실패, Gemini fallback: {out[:120]}")
+            out = call_gemini(prompt + "\n\n[지시: 공격적/모멘텀 관점에서 분석]",
+                              "gemini-2.0-flash", temperature=0.7)
+        return out
+    return "[ERROR unknown slot]"
 
 
 # =============================================================================
@@ -279,124 +329,24 @@ def main():
 각 항목은 위 데이터에서 직접 추출한 사실만 사용. 추측·일반론 금지. 1500자 이내.
 """
 
-    print("[3/5] AI 3종 호출 (Gemini, GPT-OSS, Qwen)...")
+    print("[3/5] AI 3종 호출 (Gemini + 2x OpenRouter, fallback Gemini)...")
 
     ai_results = {}
-    ai_results["Gemini"] = call_gemini(base_prompt)
-    print(f"  Gemini: {len(ai_results['Gemini'])}자")
+    ai_results["Gemini"] = call_ai_with_fallback(base_prompt, "AI1")
+    print(f"  AI1 Gemini: {len(ai_results['Gemini'])}자 / preview: {ai_results['Gemini'][:80]}")
 
-    ai_results["GPT-OSS"] = call_openrouter(base_prompt, "openai/gpt-oss-120b:free")
-    print(f"  GPT-OSS: {len(ai_results['GPT-OSS'])}자")
+    ai_results["GPT-OSS"] = call_ai_with_fallback(base_prompt, "AI2")
+    print(f"  AI2: {len(ai_results['GPT-OSS'])}자 / preview: {ai_results['GPT-OSS'][:80]}")
 
-    ai_results["Qwen3"] = call_openrouter(base_prompt, "qwen/qwen3-next-80b-a3b-instruct:free")
-    print(f"  Qwen3: {len(ai_results['Qwen3'])}자")
+    ai_results["Qwen3"] = call_ai_with_fallback(base_prompt, "AI3")
+    print(f"  AI3: {len(ai_results['Qwen3'])}자 / preview: {ai_results['Qwen3'][:80]}")
+
+    # 유효 답변 카운트
+    valid_count = sum(1 for v in ai_results.values() if not v.startswith("[ERROR") and len(v) > 200)
+    print(f"  유효 AI 답변: {valid_count}/3")
 
     print("[4/5] 메타 종합 + 팩트체크...")
 
     meta_prompt = f"""3개 AI의 답변을 보고 최종 텔레그램 브리핑을 만들어.
 규칙:
-- 시세 숫자는 시스템이 채우니 너는 [SYSTEM_DATA] 자리표시자만 둬.
-- 3개 AI 중 2개 이상 합의한 종목·해설만 채택.
-- 단독 의견은 폐기.
-- 모르면 "확인 필요"라고 명시.
-
-[AI1 Gemini]
-{ai_results['Gemini']}
-
-[AI2 GPT-OSS]
-{ai_results['GPT-OSS']}
-
-[AI3 Qwen3]
-{ai_results['Qwen3']}
-
-[출력 형식 - 그대로 따라]
-🌅 *Daily Brief {TODAY}*
-
-📌 *핵심 3줄*
-- (3개 AI 합의 내용)
--
--
-
-🇰🇷 *한국 주목 5종목 (해설만, 시세는 시스템 자동)*
-1. 종목명(코드) - 사유 (합의 N/3)
-2.
-...
-
-🇺🇸 *미국 주목 5종목*
-1.
-...
-
-⚠️ *오늘 리스크 3*
-
-✅ *체크포인트 3*
-
-전체 1500자 이내.
-"""
-
-    final_commentary = call_gemini(meta_prompt)
-
-    # 시세 블록 + AI 해설 결합 (시세는 100% 시스템 데이터)
-    final_message = f"""🌅 *Daily Brief {TODAY}*
-📡 발송: {NOW}
-
-📊 *시장 마감 (Yahoo Finance 실시간)*
-{market_block}
-
-🇰🇷 *한국 등락 TOP 10 (실시간)*
-{kr_block}
-
-🇺🇸 *미국 등락 TOP 10 (실시간)*
-{us_block}
-
-━━━━━━━━━━━━━━━━━━
-🤖 *3 AI 합의 해설*
-
-{final_commentary}
-
-━━━━━━━━━━━━━━━━━━
-※ 시세·등락률은 Yahoo Finance API 실시간 (100% 정확)
-※ 해설은 3 AI 교차검증 (단독 의견은 폐기됨)
-※ 공개정보 요약, 투자권유 아님, 손실책임 본인
-"""
-
-    # 팩트체크 (AI가 만든 숫자가 시스템 데이터와 일치하는지)
-    warnings = fact_check(final_commentary, indices, kr_data, us_data)
-    if warnings:
-        final_message += "\n⚠️ *AI 답변 팩트체크 경고*\n" + "\n".join(f"- {w}" for w in warnings)
-        print(f"  팩트체크 경고 {len(warnings)}건")
-
-    # 텔레그램 분할 발송 (4096자 제한)
-    print("[5/5] 텔레그램 발송...")
-    chunks = []
-    while final_message:
-        chunks.append(final_message[:4000])
-        final_message = final_message[4000:]
-
-    for i, chunk in enumerate(chunks, 1):
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={
-                "chat_id": TG_CHAT,
-                "text": chunk,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            },
-            timeout=30
-        )
-        result = r.json()
-        if result.get("ok"):
-            print(f"  ✓ 발송 {i}/{len(chunks)} (msg_id={result['result']['message_id']})")
-        else:
-            # Markdown 실패 시 plain으로 재시도
-            r2 = requests.post(
-                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json={"chat_id": TG_CHAT, "text": chunk, "disable_web_page_preview": True},
-                timeout=30
-            )
-            print(f"  ⚠ Markdown 실패, plain 재발송 {i}/{len(chunks)}: {r2.json().get('ok')}")
-
-    print(f"[완료] {NOW}")
-
-
-if __name__ == "__main__":
-    main()
+- 시세 숫자는 시스템이 채우니 너는 [SYS
