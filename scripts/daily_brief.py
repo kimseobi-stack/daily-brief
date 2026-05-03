@@ -84,10 +84,11 @@ def fetch_prices(stocks):
 
 
 def fetch_fundamentals(stocks):
-    """yfinance.info로 펀더멘털 수집."""
+    """yfinance.info + recommendations로 펀더멘털 수집."""
     for s in stocks:
         try:
-            info = yf.Ticker(s["yf_sym"]).info
+            t = yf.Ticker(s["yf_sym"])
+            info = t.info
             s["forward_pe"] = info.get("forwardPE")
             s["peg"] = info.get("pegRatio")
             s["eps_growth"] = info.get("earningsGrowth")
@@ -97,16 +98,44 @@ def fetch_fundamentals(stocks):
             s["target_high"] = info.get("targetHighPrice")
             s["target_low"] = info.get("targetLowPrice")
             s["recommend"] = info.get("recommendationKey")
+            s["rec_mean"] = info.get("recommendationMean")
             s["analysts"] = info.get("numberOfAnalystOpinions")
             s["beta"] = info.get("beta")
             s["52w_high"] = info.get("fiftyTwoWeekHigh")
             s["52w_low"] = info.get("fiftyTwoWeekLow")
             s["upside"] = (s["target_mean"] / s["price"] - 1) * 100 if s.get("target_mean") and s.get("price") else None
             s["off_high"] = (s["price"] / s["52w_high"] - 1) * 100 if s.get("52w_high") and s.get("price") else None
+
+            # 추천 분포 (분기별 0m = 현재 월)
+            try:
+                rec_df = t.recommendations
+                if rec_df is not None and not rec_df.empty:
+                    cur = rec_df.iloc[0]
+                    s["rec_dist"] = {
+                        "strongBuy": int(cur.get("strongBuy", 0) or 0),
+                        "buy": int(cur.get("buy", 0) or 0),
+                        "hold": int(cur.get("hold", 0) or 0),
+                        "sell": int(cur.get("sell", 0) or 0),
+                        "strongSell": int(cur.get("strongSell", 0) or 0),
+                    }
+            except Exception:
+                s["rec_dist"] = None
         except Exception:
             pass
-        time.sleep(0.1)
+        time.sleep(0.15)
     return stocks
+
+
+def fmt_rec_dist(s):
+    """애널 추천 분포 한 줄 포맷."""
+    rd = s.get("rec_dist")
+    if not rd:
+        return f"애널 {s.get('analysts') or 0}명"
+    total = sum(rd.values())
+    if total == 0:
+        return f"애널 {s.get('analysts') or 0}명"
+    return (f"애널 {total}명: 강매{rd['strongBuy']} 매수{rd['buy']} "
+            f"홀드{rd['hold']} 매도{rd['sell']} 강매도{rd['strongSell']}")
 
 
 # ============================================================
@@ -387,6 +416,7 @@ def main():
             msg2 += f" → 목표 {s['target_mean']:,.0f}원 ({s.get('upside') or 0:+.1f}%)"
         msg2 += "\n"
         msg2 += f"   진입 {e:,.0f} / 익절 {tp:,.0f} / 손절 {sl:,.0f}\n"
+        msg2 += f"   👥 {fmt_rec_dist(s)}\n"
         msg2 += f"   {' | '.join(s['detail'][:4])}\n\n"
 
     # Msg 3: 미국 추천 TOP 5
@@ -402,6 +432,7 @@ def main():
             msg3 += f" → 목표 ${s['target_mean']:,.2f} ({s.get('upside') or 0:+.1f}%)"
         msg3 += "\n"
         msg3 += f"   진입 ${e:,.2f} / 익절 ${tp:,.2f} / 손절 ${sl:,.2f}\n"
+        msg3 += f"   👥 {fmt_rec_dist(s)}\n"
         msg3 += f"   {' | '.join(s['detail'][:4])}\n\n"
 
     # Msg 4: 한국 등락 TOP/BOTTOM
@@ -413,34 +444,4 @@ def main():
     for s in kr_sorted[-8:][::-1]:
         msg4 += f"{s['name']:<8}({s['sym']}) {s['price']:>9,.0f}원 {s['change_pct']:+6.2f}% {s['signal'].split()[0]}\n"
 
-    # Msg 5: 미국 등락
-    us_sorted = sorted(us, key=lambda x: x.get("change_pct", 0), reverse=True)
-    msg5 = "🇺🇸 미국 시장 등락\n━━━━━━━━━━━━━━━\n📈 상승 TOP 8\n\n"
-    for s in us_sorted[:8]:
-        msg5 += f"{s['name']:<8}({s['sym']:<5}) ${s['price']:>8,.2f} {s['change_pct']:+6.2f}% {s['signal'].split()[0]}\n"
-    msg5 += "\n📉 하락 TOP 8\n\n"
-    for s in us_sorted[-8:][::-1]:
-        msg5 += f"{s['name']:<8}({s['sym']:<5}) ${s['price']:>8,.2f} {s['change_pct']:+6.2f}% {s['signal'].split()[0]}\n"
-
-    # Msg 6: AI 합의 종합
-    msg6 = (
-        f"🤖 AI 합의 분석 (유효 {valid}/3)\n━━━━━━━━━━━━━━━\n\n"
-        f"{final}\n\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"📡 시세: Yahoo Finance 실시간\n"
-        f"📊 펀더멘털: yfinance.info\n"
-        f"🤖 분석: Gemini + GPT-OSS + Qwen3 교차검증\n"
-        f"📰 뉴스: 한경 / 매경 / 연합 / 조선비즈\n\n"
-        f"책임: 본인"
-    )
-
-    for i, m in enumerate([msg1, msg2, msg3, msg4, msg5, msg6], 1):
-        ok = tg_send(m)
-        print(f"  Msg {i}/6: {'OK' if ok else 'FAIL'}")
-        time.sleep(1)
-
-    print(f"[완료] {NOW}")
-
-
-if __name__ == "__main__":
-    main()
+    
