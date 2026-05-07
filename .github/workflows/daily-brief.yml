@@ -17,7 +17,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests yfinance
+        run: pip install requests yfinance pandas numpy
 
       - name: Run brief
         env:
