@@ -432,20 +432,30 @@ def call_openrouter(prompt, model):
 
 
 def call_ai(prompt, slot):
+    """3단계 fallback: 1차 모델 → 2차 모델 → 3차 Gemini."""
     if slot == 1:
         out = call_gemini(prompt, "gemini-2.0-flash", 0.3)
         if out.startswith("[ERR"):
             time.sleep(2); out = call_gemini(prompt, "gemini-flash-latest", 0.3)
+        if out.startswith("[ERR"):
+            time.sleep(2); out = call_openrouter(prompt, "google/gemini-2.0-flash-exp:free")
         return out
     if slot == 2:
         out = call_openrouter(prompt, "openai/gpt-oss-120b:free")
         if out.startswith("[ERR"):
-            time.sleep(2); out = call_gemini(prompt + "\n[보수적]", "gemini-flash-latest", 0.5)
+            time.sleep(2); out = call_openrouter(prompt, "openai/gpt-oss-20b:free")
+        if out.startswith("[ERR"):
+            time.sleep(2); out = call_gemini(prompt + "\n[보수적 분석]", "gemini-flash-latest", 0.5)
         return out
     if slot == 3:
-        out = call_openrouter(prompt, "qwen/qwen3-next-80b-a3b-instruct:free")
+        # AI3: Llama 3.3 70B (Qwen 대체) → Z-AI GLM → Gemini
+        out = call_openrouter(prompt, "meta-llama/llama-3.3-70b-instruct:free")
         if out.startswith("[ERR"):
-            time.sleep(2); out = call_gemini(prompt + "\n[공격적]", "gemini-flash-latest", 0.7)
+            time.sleep(2); out = call_openrouter(prompt, "z-ai/glm-4.5-air:free")
+        if out.startswith("[ERR"):
+            time.sleep(2); out = call_openrouter(prompt, "nvidia/nemotron-nano-9b-v2:free")
+        if out.startswith("[ERR"):
+            time.sleep(2); out = call_gemini(prompt + "\n[공격적 분석]", "gemini-flash-latest", 0.7)
         return out
 
 
