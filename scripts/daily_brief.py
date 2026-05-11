@@ -323,8 +323,22 @@ def main():
     for s in holdings_stocks:
         s["action"] = holding_action_v7(s, s.get("weekly"))
 
-    kr_top = sorted(kr, key=lambda x: x["score"], reverse=True)[:3]
-    us_top = sorted(us, key=lambda x: x["score"], reverse=True)[:3]
+    # 30주선 룰: 신규 매수 후보 선정 전 필터링
+    kr_candidates = sorted(kr, key=lambda x: x["score"], reverse=True)[:10]
+    us_candidates = sorted(us, key=lambda x: x["score"], reverse=True)[:10]
+    print("  주봉 30주선 체크 (후보 20개)...")
+    for s in kr_candidates + us_candidates:
+        s["weekly"] = weekly_ma_analysis(s["sym"])
+        time.sleep(0.1)
+    # 30주선 완전 이탈 또는 30주선 아래 = 매수 후보 자격 박탈
+    kr_eligible = [s for s in kr_candidates
+                   if s.get("weekly") and not s["weekly"].get("full_break_30") and s["weekly"].get("above_30")]
+    us_eligible = [s for s in us_candidates
+                   if s.get("weekly") and not s["weekly"].get("full_break_30") and s["weekly"].get("above_30")]
+    kr_excluded = [s for s in kr_candidates if s not in kr_eligible][:3]
+    us_excluded = [s for s in us_candidates if s not in us_eligible][:3]
+    kr_top = kr_eligible[:3]
+    us_top = us_eligible[:3]
 
     accum = detect_accumulation(ind)
     news = fetch_news()
@@ -380,31 +394,9 @@ def main():
         if s.get("upside") is not None:
             msg2 += f"애널 목표가 여력 {s['upside']:+.0f}%\n"
 
-    # ===== Msg 3: 신규 매수 후보 =====
-    msg3 = "🎯 신규 매수 후보 (점수 기준)\n━━━━━━━━━━━━━\n"
+    # ===== Msg 3: 신규 매수 후보 (30주선 통과만) =====
+    msg3 = "🎯 신규 매수 후보\n━━━━━━━━━━━━━\n(30주선 위 + 점수 기준)\n"
     msg3 += "\n🇰🇷 한국 TOP 3\n"
     for i, s in enumerate(kr_top, 1):
         u = s.get("upside")
-        msg3 += f"{i}. {s['sig']} {s['name']}({s['sym']}) {s['price']:,.0f}원\n"
-        msg3 += f"   점수 {s['score']:.0f} | 여력 {u:+.0f}%\n" if u is not None else f"   점수 {s['score']:.0f}\n"
-    msg3 += "\n🇺🇸 미국 TOP 3\n"
-    for i, s in enumerate(us_top, 1):
-        u = s.get("upside")
-        msg3 += f"{i}. {s['sig']} {s['name']}({s['sym']}) ${s['price']:,.2f}\n"
-        msg3 += f"   점수 {s['score']:.0f} | 여력 {u:+.0f}%\n" if u is not None else f"   점수 {s['score']:.0f}\n"
-
-    # ===== Msg 4: AI 종합 =====
-    msg4 = (
-        f"🤖 AI 종합 분석\n━━━━━━━━━━━━━\n\n{ai_text[:3500]}"
-    )
-
-    msgs = [msg1, msg2, msg3, msg4]
-    for i, m in enumerate(msgs, 1):
-        ok = tg_send(m)
-        print(f"  Msg {i}/4: {'OK' if ok else 'FAIL'}")
-        time.sleep(1)
-    print(f"[완료] {NOW}")
-
-
-if __name__ == "__main__":
-    main()
+        w = s.g
