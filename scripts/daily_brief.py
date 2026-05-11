@@ -1,9 +1,5 @@
-"""Daily Brief v6 - 차트(4년) + 매집신호 + 3축 변증법"""
-import os
-import re
-import time
-import json as jsonlib
-import requests
+"""Daily Brief v7 - 팩트 간결 + 30주선 룰 + 매일 2회 (KST 7시/17시)"""
+import os, re, time, json as jsonlib, requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -13,7 +9,8 @@ from zoneinfo import ZoneInfo
 KST = ZoneInfo("Asia/Seoul")
 TODAY = datetime.now(KST).strftime("%Y-%m-%d")
 NOW = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
-WEEKDAY = datetime.now(KST).strftime("%a")
+HOUR = datetime.now(KST).hour
+SESSION = "오전 7시 (해외장 마감 후)" if HOUR < 12 else "오후 5시 (한국장 마감 후)"
 
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -26,12 +23,12 @@ UA = {"User-Agent": "Mozilla/5.0"}
 KR_STOCKS = [
     ("005930.KS", "삼성전자"), ("000660.KS", "SK하이닉스"),
     ("005380.KS", "현대차"), ("035420.KS", "NAVER"), ("035720.KS", "카카오"),
-    ("373220.KS", "LG에너지솔루션"), ("006400.KS", "삼성SDI"),
+    ("373220.KS", "LG에너지"), ("006400.KS", "삼성SDI"),
     ("086520.KS", "에코프로"), ("247540.KS", "에코프로비엠"),
     ("329180.KS", "HD현대중공업"), ("042660.KS", "한화오션"),
     ("010140.KS", "삼성중공업"), ("267260.KS", "HD현대일렉트릭"),
     ("010120.KS", "LS일렉트릭"), ("298040.KS", "효성중공업"),
-    ("207940.KS", "삼성바이오로직스"), ("068270.KS", "셀트리온"),
+    ("207940.KS", "삼성바이오"), ("068270.KS", "셀트리온"),
     ("005490.KS", "POSCO홀딩스"), ("105560.KS", "KB금융"),
     ("055550.KS", "신한지주"),
 ]
@@ -46,16 +43,29 @@ US_STOCKS = [
 ]
 
 
-# ============================================================
-# 1. 시세 + 펀더멘털 (기존)
-# ============================================================
-def yf_price(symbol):
+def yf_price_safe(symbol):
+    """chart API + download fallback (에코프로 같은 캐시 오류 방지)."""
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
         r = requests.get(url, headers=UA, timeout=10)
         meta = r.json()["chart"]["result"][0]["meta"]
         p = meta.get("regularMarketPrice")
         prev = meta.get("chartPreviousClose")
+
+        # 검증: download의 마지막 종가와 5% 이상 차이 시 download 사용
+        try:
+            df = yf.download(symbol, period="5d", interval="1d",
+                             progress=False, auto_adjust=False, threads=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+            if not df.empty:
+                dl_last = float(df["Close"].iloc[-1])
+                dl_prev = float(df["Close"].iloc[-2]) if len(df) >= 2 else prev
+                if p and abs(p - dl_last) / dl_last > 0.05:
+                    p = dl_last
+                    prev = dl_prev
+        except Exception:
+            pass
         chg = (p / prev - 1) * 100 if p and prev else None
         return {"price": p, "prev": prev, "change_pct": chg}
     except Exception:
@@ -63,18 +73,17 @@ def yf_price(symbol):
 
 
 def fetch_indices():
-    return {k: yf_price(s) for k, s in [
-        ("KOSPI", "^KS11"), ("KOSDAQ", "^KQ11"),
-        ("SP500", "^GSPC"), ("NASDAQ", "^IXIC"), ("DOW", "^DJI"),
+    return {k: yf_price_safe(s) for k, s in [
+        ("KOSPI", "^KS11"), ("SP500", "^GSPC"), ("NASDAQ", "^IXIC"),
         ("USDKRW", "KRW=X"), ("US10Y", "^TNX"), ("VIX", "^VIX"),
-        ("BTC", "BTC-USD"), ("WTI", "CL=F"), ("GOLD", "GC=F"),
+        ("WTI", "CL=F"),
     ]}
 
 
 def fetch_prices(stocks):
     out = []
     for sym, name in stocks:
-        d = yf_price(sym)
+        d = yf_price_safe(sym)
         if d.get("price"):
             d["sym"] = sym.split(".")[0]
             d["yf_sym"] = sym
@@ -89,9 +98,7 @@ def fetch_fundamentals(stocks):
         try:
             t = yf.Ticker(s["yf_sym"])
             info = t.info
-            s["forward_pe"] = info.get("forwardPE")
             s["peg"] = info.get("pegRatio")
-            s["eps_growth"] = info.get("earningsGrowth")
             s["eps_q_growth"] = info.get("earningsQuarterlyGrowth")
             s["target_mean"] = info.get("targetMeanPrice")
             s["recommend"] = info.get("recommendationKey")
@@ -104,11 +111,11 @@ def fetch_fundamentals(stocks):
                 if rec_df is not None and not rec_df.empty:
                     cur = rec_df.iloc[0]
                     s["rec_dist"] = {
-                        "strongBuy": int(cur.get("strongBuy", 0) or 0),
-                        "buy": int(cur.get("buy", 0) or 0),
-                        "hold": int(cur.get("hold", 0) or 0),
-                        "sell": int(cur.get("sell", 0) or 0),
-                        "strongSell": int(cur.get("strongSell", 0) or 0),
+                        "sb": int(cur.get("strongBuy", 0) or 0),
+                        "b": int(cur.get("buy", 0) or 0),
+                        "h": int(cur.get("hold", 0) or 0),
+                        "s": int(cur.get("sell", 0) or 0),
+                        "ss": int(cur.get("strongSell", 0) or 0),
                     }
             except Exception:
                 s["rec_dist"] = None
@@ -118,310 +125,111 @@ def fetch_fundamentals(stocks):
     return stocks
 
 
-# ============================================================
-# 2. 4년 일봉 + 보조지표 자체 계산 (NEW)
-# ============================================================
-def fetch_history_4y(symbol):
-    """4년치 일봉 OHLCV 데이터."""
+def weekly_ma_analysis(symbol):
+    """주봉 5/10/20/30주선 + 활성 이평선 + 30주선 룰."""
     try:
-        df = yf.download(symbol, period="4y", interval="1d",
+        df = yf.download(symbol, period="2y", interval="1wk",
                          progress=False, auto_adjust=False, threads=False)
-        if df is None or df.empty:
-            return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] for c in df.columns]
-        return df
+        if df.empty or len(df) < 30:
+            return None
+        c = df["Close"]
+        h = df["High"]
+        l = df["Low"]
+        o = df["Open"]
+        ma5 = c.rolling(5).mean().iloc[-1]
+        ma10 = c.rolling(10).mean().iloc[-1]
+        ma20 = c.rolling(20).mean().iloc[-1]
+        ma30 = c.rolling(30).mean().iloc[-1]
+        cur = c.iloc[-1]
+        # 30주선 완전 이탈 (OHLC 4값 모두 30주선 아래)
+        full_break = max(o.iloc[-1], h.iloc[-1], l.iloc[-1], c.iloc[-1]) < ma30
+        # 활성 이평선
+        if cur > ma5: active = "5주선"
+        elif cur > ma10: active = "10주선"
+        elif cur > ma20: active = "20주선"
+        elif cur > ma30: active = "30주선"
+        else: active = "30주선이탈"
+        return {
+            "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma30": ma30,
+            "active": active, "full_break_30": full_break,
+            "above_30": cur > ma30,
+        }
     except Exception:
         return None
 
 
-def calc_indicators(df):
-    """RSI / MACD / 이평선 / 볼린저밴드 자체 계산."""
-    if df is None or len(df) < 60:
-        return {}
-
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
-    vol = df["Volume"]
-
-    # 이동평균선
-    ma5 = close.rolling(5).mean()
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean()
-    ma120 = close.rolling(120).mean()
-
-    # RSI(14)
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-
-    # 볼린저밴드 (20, 2σ)
-    bb_mid = close.rolling(20).mean()
-    bb_std = close.rolling(20).std()
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-    bb_pos = ((close - bb_lower) / (bb_upper - bb_lower) * 100).iloc[-1]
-
-    # 거래량 평균 대비
-    vol_avg20 = vol.rolling(20).mean()
-    vol_ratio = vol.iloc[-1] / vol_avg20.iloc[-1] if vol_avg20.iloc[-1] else None
-
-    cur = close.iloc[-1]
-    return {
-        "rsi": float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else None,
-        "macd": float(macd.iloc[-1]),
-        "macd_signal": float(signal.iloc[-1]),
-        "macd_cross": "골든" if macd.iloc[-1] > signal.iloc[-1] and macd.iloc[-2] <= signal.iloc[-2] else (
-            "데드" if macd.iloc[-1] < signal.iloc[-1] and macd.iloc[-2] >= signal.iloc[-2] else "유지"),
-        "ma5": float(ma5.iloc[-1]),
-        "ma20": float(ma20.iloc[-1]),
-        "ma60": float(ma60.iloc[-1]),
-        "ma120": float(ma120.iloc[-1]),
-        "above_ma20": cur > ma20.iloc[-1],
-        "above_ma60": cur > ma60.iloc[-1],
-        "above_ma120": cur > ma120.iloc[-1],
-        "golden_cross_5_20": ma5.iloc[-1] > ma20.iloc[-1] and ma5.iloc[-2] <= ma20.iloc[-2],
-        "golden_cross_20_60": ma20.iloc[-1] > ma60.iloc[-1] and ma20.iloc[-5] <= ma60.iloc[-5],
-        "bb_pos": float(bb_pos) if not pd.isna(bb_pos) else None,
-        "vol_ratio": float(vol_ratio) if vol_ratio else None,
-        "high_52w": float(close.tail(252).max()),
-        "low_52w": float(close.tail(252).min()),
-        "high_4y": float(close.max()),
-    }
-
-
-def chart_pattern(ind):
-    """차트 신호 종합 텍스트."""
-    if not ind:
-        return "데이터 부족"
-    bits = []
-    rsi = ind.get("rsi")
-    if rsi:
-        if rsi > 70: bits.append(f"RSI {rsi:.0f} 과매수")
-        elif rsi < 30: bits.append(f"RSI {rsi:.0f} 과매도")
-        else: bits.append(f"RSI {rsi:.0f}")
-    if ind.get("macd_cross") == "골든":
-        bits.append("MACD 골든크로스")
-    elif ind.get("macd_cross") == "데드":
-        bits.append("MACD 데드크로스")
-    if ind.get("golden_cross_5_20"):
-        bits.append("5/20 골든")
-    if ind.get("above_ma120"):
-        bits.append("장기상승추세")
-    elif not ind.get("above_ma60"):
-        bits.append("60일선 이탈")
-    bp = ind.get("bb_pos")
-    if bp is not None:
-        if bp > 95: bits.append("볼밴 상단터치")
-        elif bp < 5: bits.append("볼밴 하단터치")
-    vr = ind.get("vol_ratio")
-    if vr and vr > 2:
-        bits.append(f"거래량 평균{vr:.1f}배")
-    return " | ".join(bits) if bits else "중립"
-
-
-def chart_score(ind):
-    """0~100 차트 점수."""
-    if not ind:
-        return 50
-    s = 50
-    rsi = ind.get("rsi")
-    if rsi:
-        if 40 < rsi < 60: s += 5
-        elif rsi > 70: s -= 10
-        elif rsi < 30: s += 10
-    if ind.get("macd_cross") == "골든": s += 10
-    elif ind.get("macd_cross") == "데드": s -= 10
-    if ind.get("above_ma20"): s += 5
-    if ind.get("above_ma60"): s += 5
-    if ind.get("above_ma120"): s += 10
-    if ind.get("golden_cross_5_20"): s += 5
-    bp = ind.get("bb_pos")
-    if bp is not None:
-        if bp > 95: s -= 5
-        elif bp < 5: s += 5
-    return max(0, min(100, s))
-
-
-# ============================================================
-# 3. 글로벌 매집 신호 (정동교 핵심)
-# ============================================================
-def detect_accumulation(ind):
-    """유가 상승 + 금리 무시 + 주가 상승 = 매집 신호."""
-    wti = (ind.get("WTI") or {}).get("change_pct") or 0
-    us10y = (ind.get("US10Y") or {}).get("change_pct") or 0
-    sp500 = (ind.get("SP500") or {}).get("change_pct") or 0
-    nasdaq = (ind.get("NASDAQ") or {}).get("change_pct") or 0
-    vix = (ind.get("VIX") or {}).get("change_pct") or 0
-
-    signals = []
-    score = 0
-
-    # 패턴 1: 유가↑ + 금리 무반응 + 주가↑ = 매집
-    if wti >= 1.0 and abs(us10y) < 0.5 and sp500 >= 0.5:
-        signals.append("🔥 매집 신호 A: 유가 상승에도 금리 잠잠 + 주가 상승. 글로벌 자금 자산매수 시작 가능성")
-        score += 30
-
-    # 패턴 2: 금리↑ + 주가↑ = 위험선호 (성장 베팅)
-    if us10y >= 1.0 and sp500 >= 0.5:
-        signals.append("📈 위험선호 강세: 금리 상승에도 주가 상승. 성장 베팅 자금 유입")
-        score += 15
-
-    # 패턴 3: VIX↓ + 나스닥↑ = 공포해소
-    if vix <= -3 and nasdaq >= 1.0:
-        signals.append("😌 공포 해소: VIX 급락 + 기술주 강세")
-        score += 10
-
-    # 패턴 4: 모든 위험자산↑ = 리스크온
-    if sp500 >= 1.0 and nasdaq >= 1.0 and (ind.get("BTC") or {}).get("change_pct", 0) >= 1.0:
-        signals.append("🌐 리스크온: 주식+암호화폐 동반 강세")
-        score += 10
-
-    # 부정 신호
-    if vix >= 3 and sp500 <= -1:
-        signals.append("⚠️ 위험회피: VIX 급등 + 주가 하락")
-        score -= 20
-
-    if us10y >= 2 and sp500 <= -1:
-        signals.append("⚠️ 금리 충격: 금리 급등으로 주가 하락")
-        score -= 15
-
-    return signals, score
-
-
-# ============================================================
-# 4. 점수 계산 + 시그널 (기존)
-# ============================================================
-def fmt_rec_dist(s):
-    rd = s.get("rec_dist")
-    if not rd or sum(rd.values()) == 0:
-        return f"애널 {s.get('analysts') or 0}명"
-    total = sum(rd.values())
-    return (f"애널 {total}명: 강매{rd['strongBuy']} 매수{rd['buy']} "
-            f"홀드{rd['hold']} 매도{rd['sell']} 강매도{rd['strongSell']}")
+def holding_action_v7(s, w):
+    """30주선 룰 우선 + 점수."""
+    if w and w.get("full_break_30"):
+        return "🔴 풀매도 (30주선 완전 이탈)"
+    if w and not w.get("above_30"):
+        return "🔴 30주선 이탈 — 매도 검토"
+    sc = s.get("score", 50)
+    chg = s.get("change_pct", 0) or 0
+    if sc >= 70 and chg > 0:
+        return "🔥 추가 매수"
+    if sc >= 55 or (w and w.get("active") in ["5주선", "10주선"]):
+        return "🟢 보유 유지"
+    if sc >= 40:
+        return "🟡 홀드 (관망)"
+    return "🟠 일부 차익실현"
 
 
 def score_stock(s):
-    """점수 100점.
-    - 펀더 (50): 여력 20 + 분기성장 15 + PEG 10 + 애널추천 5
-    - 일별 모멘텀 (35): 당일 등락 15 + 차트점수 15 + 거래량 5
-    - 메타 (15): 애널수 5 + 고점근접 10
-    """
     score = 0
-    detail = []
-
-    # 펀더 (50점)
     up = s.get("upside") or 0
-    pts = min(max(up, 0) / 30 * 20, 20)
-    score += pts
-    detail.append(f"여력 {up:+.1f}%")
-
+    score += min(max(up, 0) / 30 * 25, 25)
     g = (s.get("eps_q_growth") or 0) * 100
-    pts = min(max(g, 0) / 50 * 15, 15)
-    score += pts
-    detail.append(f"분기성장 {g:+.0f}%")
-
+    score += min(max(g, 0) / 50 * 20, 20)
     peg = s.get("peg")
     if peg and peg > 0:
-        pts = min(max(2 - peg, 0) / 2 * 10, 10)
-        detail.append(f"PEG {peg:.2f}")
-    else:
-        pts = 0
-        detail.append("PEG N/A")
-    score += pts
-
+        score += min(max(2 - peg, 0) / 2 * 10, 10)
     rec = s.get("recommend") or ""
-    rec_pts = {"strong_buy": 5, "buy": 4, "hold": 2, "sell": 1, "strong_sell": 0}.get(rec, 2)
-    score += rec_pts
-
-    # 일별 모멘텀 (35점) - 매일 변동
+    score += {"strong_buy": 10, "buy": 8, "hold": 4, "sell": 1, "strong_sell": 0}.get(rec, 4)
     chg = s.get("change_pct") or 0
-    if chg > 0:
-        pts = min(chg / 5 * 15, 15)
-    elif chg > -2:
-        pts = 5
-    else:
-        pts = max(0, 5 + chg)
-    score += pts
-    detail.append(f"당일 {chg:+.2f}%")
-
+    if chg > 0: score += min(chg / 5 * 15, 15)
+    elif chg > -2: score += 5
     cs = s.get("chart_score", 50)
-    pts = (cs - 50) / 50 * 15
-    score += max(0, min(15, pts + 7.5))
-    detail.append(f"차트 {cs}")
-
-    vr = (s.get("ind") or {}).get("vol_ratio") or 1
-    pts = min((vr - 1) * 5, 5) if vr > 1 else 0
-    score += max(0, pts)
-    if vr > 1.5:
-        detail.append(f"거래량 {vr:.1f}배")
-
-    # 메타 (15점)
+    score += (cs - 50) / 50 * 10 + 5
+    a = s.get("analysts") or 0
+    score += min(a / 30 * 10, 10)
     off = s.get("off_high")
     if off is not None:
-        pts = max(10 + off, 0) if off > -10 else max(5 + off / 2, 0)
-        pts = min(pts, 10)
-    else:
-        pts = 5
-    score += pts
-
-    a = s.get("analysts") or 0
-    pts = min(a / 30 * 5, 5)
-    score += pts
-
-    return round(score, 1), detail
+        score += min(max(10 + off, 0), 5)
+    return round(max(0, min(100, score)), 1)
 
 
 def signal_emoji(score):
-    if score >= 75: return "🔥 강력 매수"
-    if score >= 60: return "🟢 매수"
-    if score >= 45: return "🟡 홀드"
-    if score >= 30: return "🟠 매도 검토"
-    return "🔴 매도"
+    if score >= 75: return "🔥"
+    if score >= 60: return "🟢"
+    if score >= 45: return "🟡"
+    if score >= 30: return "🟠"
+    return "🔴"
 
 
-def calc_levels(s):
-    price = s["price"]
-    target = s.get("target_mean") or price * 1.15
-    return price, min(target, price * 1.30), price * 0.93
-
-
-def holding_action(s):
-    sc = s["score"]
-    chg = s.get("change_pct", 0) or 0
-    rd = s.get("rec_dist") or {}
-    sb = rd.get("strongBuy", 0) + rd.get("buy", 0)
-    total = sum(rd.values()) if rd else 0
-    buy_ratio = sb / total if total else 0
-    if sc >= 70 and buy_ratio >= 0.7:
-        return "🔥 추가 매수 검토", "강세 + 애널 매수 컨센"
-    if sc >= 55 and chg > -3:
-        return "🟢 보유 유지", "건전한 펀더멘털"
-    if sc >= 40:
-        return "🟡 홀드", "관망 권장"
-    if sc < 30 or buy_ratio < 0.3:
-        return "🔴 매도 검토", "약세 또는 컨센 부정적"
-    return "🟠 일부 차익실현", "혼조 신호"
+def detect_accumulation(ind):
+    wti = (ind.get("WTI") or {}).get("change_pct") or 0
+    us10y = (ind.get("US10Y") or {}).get("change_pct") or 0
+    sp500 = (ind.get("SP500") or {}).get("change_pct") or 0
+    vix = (ind.get("VIX") or {}).get("change_pct") or 0
+    sigs = []
+    if wti >= 1.0 and abs(us10y) < 0.5 and sp500 >= 0.5:
+        sigs.append("🔥 매집 신호 (유가↑·금리잠잠·주가↑)")
+    if us10y >= 1.0 and sp500 >= 0.5:
+        sigs.append("📈 위험선호 (금리↑·주가↑)")
+    if vix <= -3 and sp500 >= 1.0:
+        sigs.append("😌 공포 해소")
+    if vix >= 5 and sp500 <= -1:
+        sigs.append("⚠️ 위험회피")
+    return sigs
 
 
 def fetch_news():
-    feeds = [
-        "https://www.hankyung.com/feed/finance",
-        "https://www.mk.co.kr/rss/50200011/",
-        "https://www.yna.co.kr/rss/economy.xml",
-        "https://biz.chosun.com/site/data/rss/rss.xml",
-    ]
+    feeds = ["https://www.hankyung.com/feed/finance",
+             "https://www.mk.co.kr/rss/50200011/",
+             "https://www.yna.co.kr/rss/economy.xml"]
     out = []
     for url in feeds:
         try:
@@ -430,26 +238,24 @@ def fetch_news():
                 h = m.group(1).strip()
                 if h and len(h) > 5 and "RSS" not in h:
                     out.append(h)
-                    if len(out) >= 50:
-                        break
+                    if len(out) >= 30: break
         except Exception:
             continue
-    return out[:40]
+    return out[:25]
 
 
-def call_gemini(prompt, model="gemini-flash-latest", temp=0.3):
+def call_gemini(prompt, model="gemini-flash-latest"):
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-        r = requests.post(url, json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 2500, "temperature": temp}
-        }, timeout=60)
-        if r.status_code != 200: return f"[ERR Gemini {model} {r.status_code}]"
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}",
+            json={"contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"maxOutputTokens": 1500, "temperature": 0.3}},
+            timeout=60)
+        if r.status_code != 200: return ""
         d = r.json()
-        text = d.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        return text if len(text) > 100 else f"[ERR Gemini {model} short]"
-    except Exception as e:
-        return f"[ERR Gemini: {type(e).__name__}]"
+        return d.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    except Exception:
+        return ""
 
 
 def call_openrouter(prompt, model):
@@ -457,42 +263,26 @@ def call_openrouter(prompt, model):
         r = requests.post("https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json",
                      "HTTP-Referer": "https://github.com/kimseobi-stack/daily-brief", "X-Title": "Daily Brief"},
-            json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 2500},
+            json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1500},
             timeout=120)
-        if r.status_code != 200: return f"[ERR OR {model} {r.status_code}]"
-        d = r.json()
-        text = d.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return text if len(text) > 100 else f"[ERR OR short]"
-    except Exception as e:
-        return f"[ERR OR: {type(e).__name__}]"
+        if r.status_code != 200: return ""
+        return r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception:
+        return ""
 
 
-def call_ai(prompt, slot):
-    """3단계 fallback: 1차 모델 → 2차 모델 → 3차 Gemini."""
-    if slot == 1:
-        out = call_gemini(prompt, "gemini-2.0-flash", 0.3)
-        if out.startswith("[ERR"):
-            time.sleep(2); out = call_gemini(prompt, "gemini-flash-latest", 0.3)
-        if out.startswith("[ERR"):
-            time.sleep(2); out = call_openrouter(prompt, "google/gemini-2.0-flash-exp:free")
-        return out
-    if slot == 2:
-        out = call_openrouter(prompt, "openai/gpt-oss-120b:free")
-        if out.startswith("[ERR"):
-            time.sleep(2); out = call_openrouter(prompt, "openai/gpt-oss-20b:free")
-        if out.startswith("[ERR"):
-            time.sleep(2); out = call_gemini(prompt + "\n[보수적 분석]", "gemini-flash-latest", 0.5)
-        return out
-    if slot == 3:
-        # AI3: Llama 3.3 70B (Qwen 대체) → Z-AI GLM → Gemini
-        out = call_openrouter(prompt, "meta-llama/llama-3.3-70b-instruct:free")
-        if out.startswith("[ERR"):
-            time.sleep(2); out = call_openrouter(prompt, "z-ai/glm-4.5-air:free")
-        if out.startswith("[ERR"):
-            time.sleep(2); out = call_openrouter(prompt, "nvidia/nemotron-nano-9b-v2:free")
-        if out.startswith("[ERR"):
-            time.sleep(2); out = call_gemini(prompt + "\n[공격적 분석]", "gemini-flash-latest", 0.7)
-        return out
+def best_ai(prompt):
+    """3 AI 호출 후 가장 긴 답변 채택."""
+    results = []
+    r1 = call_gemini(prompt, "gemini-flash-latest")
+    if len(r1) > 200: results.append(r1)
+    time.sleep(2)
+    r2 = call_openrouter(prompt, "openai/gpt-oss-120b:free")
+    if len(r2) > 200: results.append(r2)
+    time.sleep(2)
+    r3 = call_openrouter(prompt, "meta-llama/llama-3.3-70b-instruct:free")
+    if len(r3) > 200: results.append(r3)
+    return max(results, key=len) if results else "분석 실패"
 
 
 def tg_send(text):
@@ -503,248 +293,115 @@ def tg_send(text):
 
 
 def main():
-    print(f"[{NOW}] Daily Brief v6")
+    print(f"[{NOW}] Daily Brief v7 - {SESSION}")
     ind = fetch_indices()
     kr = fetch_fundamentals(fetch_prices(KR_STOCKS))
     us = fetch_fundamentals(fetch_prices(US_STOCKS))
 
+    # 보유 종목
     holdings_stocks = []
     for h in HOLDINGS:
-        d = yf_price(h["sym"])
+        d = yf_price_safe(h["sym"])
         if d.get("price"):
-            d["sym"] = h["sym"]
-            d["yf_sym"] = h["sym"]
-            d["name"] = h["name"]
-            d["qty"] = h.get("qty", 0)
+            d["sym"] = h["sym"]; d["yf_sym"] = h["sym"]
+            d["name"] = h["name"]; d["qty"] = h.get("qty", 0)
             holdings_stocks.append(d)
         time.sleep(0.05)
     holdings_stocks = fetch_fundamentals(holdings_stocks)
-    print(f"  KR={len(kr)} US={len(us)} 보유={len(holdings_stocks)}")
 
-    for s in kr + us + holdings_stocks:
-        s["score"], s["detail"] = score_stock(s)
-        s["signal"] = signal_emoji(s["score"])
-
+    # 주봉 분석 (보유만)
     for s in holdings_stocks:
-        s["action"], s["action_reason"] = holding_action(s)
-
-    kr_top = sorted(kr, key=lambda x: x["score"], reverse=True)[:5]
-    us_top = sorted(us, key=lambda x: x["score"], reverse=True)[:5]
-
-    # 4년 일봉 + 보조지표 (보유 + TOP 5 한국 + TOP 5 미국)
-    print("[차트] 4년 일봉 + 보조지표 계산...")
-    chart_targets = holdings_stocks + kr_top + us_top
-    seen = set()
-    unique_targets = []
-    for s in chart_targets:
-        if s["yf_sym"] not in seen:
-            unique_targets.append(s)
-            seen.add(s["yf_sym"])
-    for s in unique_targets:
-        df = fetch_history_4y(s["yf_sym"])
-        s["ind"] = calc_indicators(df)
-        s["chart_pattern"] = chart_pattern(s["ind"])
-        s["chart_score"] = chart_score(s["ind"])
+        s["weekly"] = weekly_ma_analysis(s["sym"])
         time.sleep(0.1)
 
-    # 매집 신호
-    accum_signals, accum_score = detect_accumulation(ind)
+    # 점수
+    for s in kr + us + holdings_stocks:
+        s["chart_score"] = 50
+        s["score"] = score_stock(s)
+        s["sig"] = signal_emoji(s["score"])
 
+    for s in holdings_stocks:
+        s["action"] = holding_action_v7(s, s.get("weekly"))
+
+    kr_top = sorted(kr, key=lambda x: x["score"], reverse=True)[:3]
+    us_top = sorted(us, key=lambda x: x["score"], reverse=True)[:3]
+
+    accum = detect_accumulation(ind)
     news = fetch_news()
 
-    # 3축 변증법 프롬프트 (사실 100% 강제)
-    base_prompt = (
-        f"한미 주식 3축 변증법 분석 ({TODAY}).\n\n"
-        "절대 규칙:\n"
-        "1. 추론에 추론 금지. 모든 근거는 아래 제공된 사실만 사용.\n"
-        "2. 모르는 종목/숫자는 '확인 필요'로 표시.\n"
-        "3. 일반론 회피 금지 (예: '미국 시장 호조' 같은 두루뭉술 X).\n"
-        "4. 차트/펀더/시황 3축이 충돌하면 충돌을 명시하고 어느 축이 강한지 판단.\n\n"
-        f"[시황 축]\n"
-        f"KOSPI {ind['KOSPI']['price']:,.2f}({ind['KOSPI']['change_pct']:+.2f}%), "
-        f"SP500 {ind['SP500']['price']:,.2f}({ind['SP500']['change_pct']:+.2f}%), "
-        f"USD/KRW {ind['USDKRW']['price']:,.2f}, VIX {ind['VIX']['price']:.2f}, "
-        f"WTI {ind['WTI']['price']:.2f}({ind['WTI']['change_pct']:+.2f}%), "
-        f"US10Y {ind['US10Y']['price']:.2f}%({ind['US10Y']['change_pct']:+.2f}%)\n"
-        f"매집 신호: {' / '.join(accum_signals) if accum_signals else '없음'} (점수 {accum_score})\n\n"
-        f"[펀더 축 - 한국 TOP5]\n" + "\n".join(
-            f"{s['name']}({s['sym']}) 점수{s['score']} 여력{s.get('upside') or 0:+.0f}% PEG{s.get('peg') or 0:.2f}"
-            for s in kr_top) + "\n\n"
-        f"[펀더 축 - 미국 TOP5]\n" + "\n".join(
-            f"{s['name']}({s['sym']}) 점수{s['score']} 여력{s.get('upside') or 0:+.0f}%"
-            for s in us_top) + "\n\n"
-        f"[차트 축 - 보유+TOP10 패턴]\n" + "\n".join(
-            f"{s['name']}({s['sym']}): {s.get('chart_pattern','N/A')} (차트점수 {s.get('chart_score',50)})"
-            for s in unique_targets[:15]) + "\n\n"
-        f"[뉴스 헤드라인]\n" + " | ".join(news[:15]) + "\n\n"
-        "출력 (1500자 이내):\n"
-        "📊 시장 진단 (시황축)\n"
-        "🎯 한국 매수 3개 (3축 합의 종목, 충돌 시 명시)\n"
-        "🎯 미국 매수 3개\n"
-        "⚠️ 회피 종목 (3축 부정)\n"
-        "🔮 일주일 전망"
+    # AI 분석 (단일 통합)
+    ai_prompt = (
+        f"한미 주식 팩트 분석 ({TODAY} {SESSION}). 추측 금지, 사실만.\n"
+        f"KOSPI {ind['KOSPI']['price']:.2f}({ind['KOSPI']['change_pct']:+.2f}%), "
+        f"SP500 {ind['SP500']['price']:.2f}({ind['SP500']['change_pct']:+.2f}%), "
+        f"USD/KRW {ind['USDKRW']['price']:.2f}, VIX {ind['VIX']['price']:.2f}\n"
+        f"매집신호: {' / '.join(accum) if accum else '없음'}\n"
+        f"한국TOP3: " + ", ".join(f"{s['name']}({s['sym']}) 점수{s['score']}" for s in kr_top) + "\n"
+        f"미국TOP3: " + ", ".join(f"{s['name']}({s['sym']}) 점수{s['score']}" for s in us_top) + "\n"
+        f"뉴스: " + " | ".join(news[:10]) + "\n\n"
+        "출력 (700자 이내):\n"
+        "📊 시장 한 줄\n"
+        "🇰🇷 한국 주목 종목 1개 + 이유 1줄\n"
+        "🇺🇸 미국 주목 종목 1개 + 이유 1줄\n"
+        "⚠️ 오늘 리스크 1줄\n"
+        "🔮 다음 흐름 1줄"
     )
+    ai_text = best_ai(ai_prompt)
+    print(f"  AI 답변: {len(ai_text)}자")
 
-    print("[AI] 3축 변증법 분석...")
-    ai = []
-    for slot in [1, 2, 3]:
-        r = call_ai(base_prompt, slot)
-        ai.append(r)
-        print(f"  AI{slot}: {len(r)}자")
-        time.sleep(2)
-    valid = sum(1 for r in ai if not r.startswith("[ERR") and len(r) > 200)
-
-    meta = (
-        "3 AI 답변 종합. 2/3 합의만 채택. 단독 의견 폐기. 사실 100% 검증.\n\n"
-        f"[AI1]\n{ai[0]}\n[AI2]\n{ai[1]}\n[AI3]\n{ai[2]}\n\n"
-        "출력:\n📊 시장 진단\n🎯 한국 매수 3 (3축 합의)\n🎯 미국 매수 3\n⚠️ 회피\n🔮 전망"
-    )
-    final = call_gemini(meta)
-    if final.startswith("[ERR"):
-        final = next((r for r in ai if not r.startswith("[ERR")), "분석 실패")
-
-    # ===== Msg 0: 보유 진단 (차트 추가) =====
-    msg0 = "💼 내 보유 종목 진단\n━━━━━━━━━━━━━━━\n(시세+펀더+차트+애널 종합)\n\n"
-    if not holdings_stocks:
-        msg0 += "보유 종목 없음\n"
-    else:
-        for s in sorted(holdings_stocks, key=lambda x: x["score"], reverse=True):
-            sd = s["sym"].replace(".KS", "")
-            cur = f"${s['price']:,.2f}" if not s["sym"].endswith(".KS") else f"{s['price']:,.0f}원"
-            msg0 += "━━━━━━━━━━━━━━━\n"
-            msg0 += f"{s['action']}  점수 {s['score']}/100\n"
-            msg0 += f"{s['name']} ({sd})  보유 {s['qty']}주\n"
-            msg0 += f"현재 {cur}  ({s.get('change_pct') or 0:+.2f}%)\n"
-            if s.get("target_mean"):
-                tg = f"${s['target_mean']:,.2f}" if not s["sym"].endswith(".KS") else f"{s['target_mean']:,.0f}원"
-                msg0 += f"목표 {tg}  여력 {s.get('upside') or 0:+.1f}%\n"
-            msg0 += f"📈 차트: {s.get('chart_pattern','N/A')} (점수 {s.get('chart_score',50)})\n"
-            msg0 += f"👥 {fmt_rec_dist(s)}\n"
-            msg0 += f"💡 {s['action_reason']}\n\n"
-
-    # ===== Msg 1: 거시 + 매집 신호 =====
+    # ===== Msg 1: 핵심 요약 =====
     msg1 = (
-        f"🌅 Daily Brief v6\n📅 {TODAY} ({WEEKDAY})  📡 {NOW}\n━━━━━━━━━━━━━━━\n📊 거시 지표\n\n"
+        f"🌅 Daily Brief — {SESSION}\n📅 {TODAY}  📡 {NOW}\n"
+        f"━━━━━━━━━━━━━\n📊 거시 (실시간)\n\n"
         f"KOSPI    {ind['KOSPI']['price']:>10,.2f}  {ind['KOSPI']['change_pct']:+.2f}%\n"
-        f"KOSDAQ   {ind['KOSDAQ']['price']:>10,.2f}  {ind['KOSDAQ']['change_pct']:+.2f}%\n"
         f"SP500    {ind['SP500']['price']:>10,.2f}  {ind['SP500']['change_pct']:+.2f}%\n"
         f"NASDAQ   {ind['NASDAQ']['price']:>10,.2f}  {ind['NASDAQ']['change_pct']:+.2f}%\n"
-        f"DOW      {ind['DOW']['price']:>10,.2f}  {ind['DOW']['change_pct']:+.2f}%\n\n"
-        f"USD/KRW  {ind['USDKRW']['price']:>10,.2f}  {ind['USDKRW']['change_pct']:+.2f}%\n"
-        f"US 10Y   {ind['US10Y']['price']:>10.3f}%  {ind['US10Y']['change_pct']:+.2f}%\n"
+        f"USDKRW   {ind['USDKRW']['price']:>10,.2f}  {ind['USDKRW']['change_pct']:+.2f}%\n"
+        f"US10Y    {ind['US10Y']['price']:>10.3f}%  {ind['US10Y']['change_pct']:+.2f}%\n"
         f"VIX      {ind['VIX']['price']:>10,.2f}  {ind['VIX']['change_pct']:+.2f}%\n"
-        f"WTI     ${ind['WTI']['price']:>9,.2f}  {ind['WTI']['change_pct']:+.2f}%\n"
-        f"GOLD    ${ind['GOLD']['price']:>9,.2f}  {ind['GOLD']['change_pct']:+.2f}%\n"
-        f"BTC     ${ind['BTC']['price']:>9,.0f}  {ind['BTC']['change_pct']:+.2f}%\n\n"
-        f"━━━━━━━━━━━━━━━\n🌐 글로벌 자금 매집 신호 (정동교 트리거)\n\n"
+        f"WTI     ${ind['WTI']['price']:>9,.2f}  {ind['WTI']['change_pct']:+.2f}%\n\n"
     )
-    if accum_signals:
-        for sig in accum_signals:
-            msg1 += f"{sig}\n\n"
-        msg1 += f"종합 매집 점수: {accum_score:+d}\n"
+    if accum:
+        msg1 += "🌐 매집 신호\n" + "\n".join(accum) + "\n"
     else:
-        msg1 += "오늘 특이 매집 신호 없음. 일반 흐름.\n"
+        msg1 += "🌐 매집 신호: 없음\n"
 
-    # ===== Msg 2: 한국 매수 후보 + 차트 =====
-    msg2 = "🇰🇷 한국 매수 후보 TOP 5\n━━━━━━━━━━━━━━━\n(펀더+차트+애널 종합)\n\n"
+    # ===== Msg 2: 보유 종목 (간결) =====
+    msg2 = "💼 보유 종목 진단\n━━━━━━━━━━━━━\n"
+    for s in sorted(holdings_stocks, key=lambda x: 0 if "풀매도" in x.get("action","") else 1):
+        cur = f"${s['price']:,.2f}" if not s["sym"].endswith(".KS") else f"{s['price']:,.0f}원"
+        chg = s.get("change_pct") or 0
+        w = s.get("weekly") or {}
+        msg2 += f"\n{s['action']}\n"
+        msg2 += f"{s['name']} ({s['sym']}) {s['qty']}주\n"
+        msg2 += f"가격 {cur} ({chg:+.2f}%) | 점수 {s['score']:.0f}/100\n"
+        if w:
+            msg2 += f"주봉 활성: {w['active']} | 30주선 {'위' if w['above_30'] else '아래'}\n"
+        if s.get("upside") is not None:
+            msg2 += f"애널 목표가 여력 {s['upside']:+.0f}%\n"
+
+    # ===== Msg 3: 신규 매수 후보 =====
+    msg3 = "🎯 신규 매수 후보 (점수 기준)\n━━━━━━━━━━━━━\n"
+    msg3 += "\n🇰🇷 한국 TOP 3\n"
     for i, s in enumerate(kr_top, 1):
-        e, tp, sl = calc_levels(s)
-        msg2 += f"{i}. {s['signal']}  펀더{s['score']} / 차트{s.get('chart_score',50)}\n"
-        msg2 += f"   {s['name']} ({s['sym']})\n"
-        msg2 += f"   현재 {s['price']:,.0f}원"
-        if s.get("target_mean"):
-            msg2 += f" → 목표 {s['target_mean']:,.0f}원 ({s.get('upside') or 0:+.1f}%)"
-        msg2 += "\n"
-        msg2 += f"   진입 {e:,.0f} / 익절 {tp:,.0f} / 손절 {sl:,.0f}\n"
-        msg2 += f"   📈 {s.get('chart_pattern','N/A')}\n"
-        msg2 += f"   👥 {fmt_rec_dist(s)}\n"
-        msg2 += f"   {' | '.join(s['detail'][:3])}\n\n"
-
-    # ===== Msg 3: 미국 매수 후보 + 차트 =====
-    msg3 = "🇺🇸 미국 매수 후보 TOP 5\n━━━━━━━━━━━━━━━\n(펀더+차트+애널 종합)\n\n"
+        u = s.get("upside")
+        msg3 += f"{i}. {s['sig']} {s['name']}({s['sym']}) {s['price']:,.0f}원\n"
+        msg3 += f"   점수 {s['score']:.0f} | 여력 {u:+.0f}%\n" if u is not None else f"   점수 {s['score']:.0f}\n"
+    msg3 += "\n🇺🇸 미국 TOP 3\n"
     for i, s in enumerate(us_top, 1):
-        e, tp, sl = calc_levels(s)
-        msg3 += f"{i}. {s['signal']}  펀더{s['score']} / 차트{s.get('chart_score',50)}\n"
-        msg3 += f"   {s['name']} ({s['sym']})\n"
-        msg3 += f"   현재 ${s['price']:,.2f}"
-        if s.get("target_mean"):
-            msg3 += f" → 목표 ${s['target_mean']:,.2f} ({s.get('upside') or 0:+.1f}%)"
-        msg3 += "\n"
-        msg3 += f"   진입 ${e:,.2f} / 익절 ${tp:,.2f} / 손절 ${sl:,.2f}\n"
-        msg3 += f"   📈 {s.get('chart_pattern','N/A')}\n"
-        msg3 += f"   👥 {fmt_rec_dist(s)}\n"
-        msg3 += f"   {' | '.join(s['detail'][:3])}\n\n"
+        u = s.get("upside")
+        msg3 += f"{i}. {s['sig']} {s['name']}({s['sym']}) ${s['price']:,.2f}\n"
+        msg3 += f"   점수 {s['score']:.0f} | 여력 {u:+.0f}%\n" if u is not None else f"   점수 {s['score']:.0f}\n"
 
-    # ===== Msg 4: 한국 등락 =====
-    kr_sorted = sorted(kr, key=lambda x: x.get("change_pct", 0) or 0, reverse=True)
-    msg4 = "🇰🇷 한국 등락\n━━━━━━━━━━━━━━━\n📈 상승 TOP 8\n\n"
-    for s in kr_sorted[:8]:
-        c = s.get('change_pct') or 0
-        msg4 += f"{s['name']:<8}({s['sym']}) {s['price']:>9,.0f}원 {c:+6.2f}% {s['signal'].split()[0]}\n"
-    msg4 += "\n📉 하락 TOP 8\n\n"
-    for s in kr_sorted[-8:][::-1]:
-        c = s.get('change_pct') or 0
-        msg4 += f"{s['name']:<8}({s['sym']}) {s['price']:>9,.0f}원 {c:+6.2f}% {s['signal'].split()[0]}\n"
-
-    # ===== Msg 5: 미국 등락 =====
-    us_sorted = sorted(us, key=lambda x: x.get("change_pct", 0) or 0, reverse=True)
-    msg5 = "🇺🇸 미국 등락\n━━━━━━━━━━━━━━━\n📈 상승 TOP 8\n\n"
-    for s in us_sorted[:8]:
-        c = s.get('change_pct') or 0
-        msg5 += f"{s['name']:<8}({s['sym']:<5}) ${s['price']:>8,.2f} {c:+6.2f}% {s['signal'].split()[0]}\n"
-    msg5 += "\n📉 하락 TOP 8\n\n"
-    for s in us_sorted[-8:][::-1]:
-        c = s.get('change_pct') or 0
-        msg5 += f"{s['name']:<8}({s['sym']:<5}) ${s['price']:>8,.2f} {c:+6.2f}% {s['signal'].split()[0]}\n"
-
-    # ===== Msg 6: 3축 변증법 AI 분석 =====
-    msg6 = (
-        f"🤖 AI 3축 변증법 분석 (유효 {valid}/3)\n━━━━━━━━━━━━━━━\n"
-        f"(차트 + 펀더 + 시황 충돌 검증)\n\n{final}"
+    # ===== Msg 4: AI 종합 =====
+    msg4 = (
+        f"🤖 AI 종합 분석\n━━━━━━━━━━━━━\n\n{ai_text[:3500]}"
     )
 
-    # ===== Msg 7: 최종 액션 플랜 =====
-    msg7 = "🎯 오늘의 최종 액션 플랜\n━━━━━━━━━━━━━━━\n\n"
-    add_buy = [s for s in holdings_stocks if "추가 매수" in s.get('action', '')]
-    hold = [s for s in holdings_stocks if "보유 유지" in s.get('action', '') or "홀드" in s.get('action', '')]
-    take_profit = [s for s in holdings_stocks if "차익실현" in s.get('action', '')]
-    sell = [s for s in holdings_stocks if "매도 검토" in s.get('action', '')]
-
-    msg7 += "📌 보유 종목\n\n"
-    if add_buy:
-        msg7 += "🔥 추가 매수 검토\n"
-        for s in add_buy:
-            msg7 += f"  • {s['name']}({s['sym'].replace('.KS','')}) - {s['action_reason']}\n"
-        msg7 += "\n"
-    if hold:
-        msg7 += "🟢 보유 유지\n"
-        for s in hold:
-            msg7 += f"  • {s['name']}({s['sym'].replace('.KS','')})\n"
-        msg7 += "\n"
-    if take_profit:
-        msg7 += "🟠 일부 차익실현\n"
-        for s in take_profit:
-            msg7 += f"  • {s['name']}({s['sym'].replace('.KS','')}) - {s['action_reason']}\n"
-        msg7 += "\n"
-    if sell:
-        msg7 += "🔴 매도 검토\n"
-        for s in sell:
-            msg7 += f"  • {s['name']}({s['sym'].replace('.KS','')}) - {s['action_reason']}\n"
-        msg7 += "\n"
-
-    msg7 += "📌 신규 매수 후보\n\n🇰🇷 한국 TOP 3\n"
-    for i, s in enumerate(kr_top[:3], 1):
-        msg7 += f"  {i}. {s['name']}({s['sym']}) 펀더{s['score']}/차트{s.get('chart_score',50)}  여력{s.get('upside') or 0:+.0f}%\n"
-    msg7 += "\n🇺🇸 미국 TOP 3\n"
-    for i, s in enumerate(us_top[:3], 1):
-        msg7 += f"  {i}. {s['name']}({s['sym']}) 펀더{s['score']}/차트{s.get('chart_score',50)}  여력{s.get('upside') or 0:+.0f}%\n"
-
-    # 면책 제거
-
-    msgs = [msg0, msg1, msg2, msg3, msg4, msg5, msg6, msg7]
+    msgs = [msg1, msg2, msg3, msg4]
     for i, m in enumerate(msgs, 1):
         ok = tg_send(m)
-        print(f"  Msg {i}/{len(msgs)}: {'OK' if ok else 'FAIL'}")
+        print(f"  Msg {i}/4: {'OK' if ok else 'FAIL'}")
         time.sleep(1)
     print(f"[완료] {NOW}")
 
