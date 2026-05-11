@@ -313,27 +313,61 @@ def fmt_rec_dist(s):
 
 
 def score_stock(s):
+    """점수 100점.
+    - 펀더 (50): 여력 20 + 분기성장 15 + PEG 10 + 애널추천 5
+    - 일별 모멘텀 (35): 당일 등락 15 + 차트점수 15 + 거래량 5
+    - 메타 (15): 애널수 5 + 고점근접 10
+    """
     score = 0
     detail = []
+
+    # 펀더 (50점)
     up = s.get("upside") or 0
-    pts = min(max(up, 0) / 30 * 30, 30)
+    pts = min(max(up, 0) / 30 * 20, 20)
     score += pts
     detail.append(f"여력 {up:+.1f}%")
+
     g = (s.get("eps_q_growth") or 0) * 100
-    pts = min(max(g, 0) / 50 * 20, 20)
+    pts = min(max(g, 0) / 50 * 15, 15)
     score += pts
     detail.append(f"분기성장 {g:+.0f}%")
+
     peg = s.get("peg")
     if peg and peg > 0:
-        pts = min(max(2 - peg, 0) / 2 * 15, 15)
+        pts = min(max(2 - peg, 0) / 2 * 10, 10)
         detail.append(f"PEG {peg:.2f}")
     else:
         pts = 0
         detail.append("PEG N/A")
     score += pts
+
     rec = s.get("recommend") or ""
-    rec_score = {"strong_buy": 15, "buy": 12, "hold": 7, "sell": 3, "strong_sell": 0}.get(rec, 5)
-    score += rec_score
+    rec_pts = {"strong_buy": 5, "buy": 4, "hold": 2, "sell": 1, "strong_sell": 0}.get(rec, 2)
+    score += rec_pts
+
+    # 일별 모멘텀 (35점) - 매일 변동
+    chg = s.get("change_pct") or 0
+    if chg > 0:
+        pts = min(chg / 5 * 15, 15)
+    elif chg > -2:
+        pts = 5
+    else:
+        pts = max(0, 5 + chg)
+    score += pts
+    detail.append(f"당일 {chg:+.2f}%")
+
+    cs = s.get("chart_score", 50)
+    pts = (cs - 50) / 50 * 15
+    score += max(0, min(15, pts + 7.5))
+    detail.append(f"차트 {cs}")
+
+    vr = (s.get("ind") or {}).get("vol_ratio") or 1
+    pts = min((vr - 1) * 5, 5) if vr > 1 else 0
+    score += max(0, pts)
+    if vr > 1.5:
+        detail.append(f"거래량 {vr:.1f}배")
+
+    # 메타 (15점)
     off = s.get("off_high")
     if off is not None:
         pts = max(10 + off, 0) if off > -10 else max(5 + off / 2, 0)
@@ -341,9 +375,11 @@ def score_stock(s):
     else:
         pts = 5
     score += pts
+
     a = s.get("analysts") or 0
-    pts = min(a / 30 * 10, 10)
+    pts = min(a / 30 * 5, 5)
     score += pts
+
     return round(score, 1), detail
 
 
@@ -664,8 +700,7 @@ def main():
     # ===== Msg 6: 3축 변증법 AI 분석 =====
     msg6 = (
         f"🤖 AI 3축 변증법 분석 (유효 {valid}/3)\n━━━━━━━━━━━━━━━\n"
-        f"(차트 + 펀더 + 시황 충돌 검증)\n\n{final}\n\n"
-        f"━━━━━━━━━━━━━━━\n📡 Yahoo Finance / 🤖 Gemini+OpenRouter\n책임: 본인"
+        f"(차트 + 펀더 + 시황 충돌 검증)\n\n{final}"
     )
 
     # ===== Msg 7: 최종 액션 플랜 =====
@@ -704,13 +739,7 @@ def main():
     for i, s in enumerate(us_top[:3], 1):
         msg7 += f"  {i}. {s['name']}({s['sym']}) 펀더{s['score']}/차트{s.get('chart_score',50)}  여력{s.get('upside') or 0:+.0f}%\n"
 
-    msg7 += (
-        "\n━━━━━━━━━━━━━━━\n📋 결정 가이드\n"
-        "• 위 액션은 시스템 권고 (3축 변증)\n"
-        "• 차트+펀더+시황 충돌 시 직접 판단\n"
-        "• 본인 진행/수정/삭제\n"
-        "• 매매 책임: 본인"
-    )
+    # 면책 제거
 
     msgs = [msg0, msg1, msg2, msg3, msg4, msg5, msg6, msg7]
     for i, m in enumerate(msgs, 1):
