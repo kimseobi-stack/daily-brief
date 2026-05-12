@@ -1,10 +1,16 @@
-"""Daily Brief v7 - 팩트 간결 + 30주선 룰 + 매일 2회 (KST 7시/17시)"""
+"""Daily Brief v8 - 키움 모의/실전 연동 + 30주선 룰 + 매일 2회 (KST 7시/17시)"""
 import os, re, time, json as jsonlib, requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+try:
+    import kiwoom_sync as kw
+    KIWOOM_AVAILABLE = True
+except ImportError:
+    KIWOOM_AVAILABLE = False
 
 KST = ZoneInfo("Asia/Seoul")
 TODAY = datetime.now(KST).strftime("%Y-%m-%d")
@@ -43,8 +49,19 @@ US_STOCKS = [
 ]
 
 
+# 키움 토큰 (모듈 로드 시 1회)
+KIWOOM_TOKEN = kw.get_token() if KIWOOM_AVAILABLE else None
+print(f"  Kiwoom Token: {'OK' if KIWOOM_TOKEN else 'NONE'}")
+
+
 def yf_price_safe(symbol):
-    """chart API + download fallback (에코프로 같은 캐시 오류 방지)."""
+    """chart API + download fallback (에코프로 같은 캐시 오류 방지). 한국 종목은 키움 우선."""
+    # 키움 우선 (한국 종목, 6자리 숫자)
+    if KIWOOM_TOKEN and symbol.endswith(".KS"):
+        kr_sym = symbol.replace(".KS", "")
+        q = kw.fetch_kr_quote(KIWOOM_TOKEN, kr_sym)
+        if q and q.get("price"):
+            return {"price": q["price"], "prev": q["prev"], "change_pct": q["change_pct"]}
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
         r = requests.get(url, headers=UA, timeout=10)
@@ -293,18 +310,49 @@ def tg_send(text):
 
 
 def main():
-    print(f"[{NOW}] Daily Brief v7 - {SESSION}")
+    print(f"[{NOW}] Daily Brief v8 - {SESSION}")
     ind = fetch_indices()
     kr = fetch_fundamentals(fetch_prices(KR_STOCKS))
     us = fetch_fundamentals(fetch_prices(US_STOCKS))
 
-    # 보유 종목
+    # 보유 종목 (키움 + HOLDINGS_JSON 병합)
     holdings_stocks = []
+    kw_balance = None
+    kw_deposit = 0
+    if KIWOOM_TOKEN:
+        kw_balance = kw.fetch_balance(KIWOOM_TOKEN)
+        if kw_balance:
+            kw_deposit = kw_balance.get("deposit", 0)
+            for h in kw_balance.get("holdings", []):
+                if not h.get("sym"):
+                    continue
+                ks_sym = f"{h['sym']}.KS"
+                holdings_stocks.append({
+                    "sym": ks_sym, "yf_sym": ks_sym,
+                    "name": h["name"], "qty": h["qty"],
+                    "avg_price": h["avg_price"],
+                    "price": h["cur_price"],
+                    "prev": None, "change_pct": None,
+                    "eval_amt": h["eval_amt"], "pl_amt": h["pl_amt"],
+                    "kw_pl_pct": h["pl_pct"],
+                    "_from_kiwoom": True,
+                })
+            kw_kr_syms = {h["sym"] for h in kw_balance.get("holdings", [])}
+        else:
+            kw_kr_syms = set()
+    else:
+        kw_kr_syms = set()
+
+    # HOLDINGS_JSON 미국 종목 + 키움 미수록 한국 종목
     for h in HOLDINGS:
+        sym_clean = h["sym"].replace(".KS", "")
+        if sym_clean in kw_kr_syms:
+            continue  # 키움에서 이미 가져옴
         d = yf_price_safe(h["sym"])
         if d.get("price"):
             d["sym"] = h["sym"]; d["yf_sym"] = h["sym"]
             d["name"] = h["name"]; d["qty"] = h.get("qty", 0)
+            d["avg_price"] = h.get("avg_price")
             holdings_stocks.append(d)
         time.sleep(0.05)
     holdings_stocks = fetch_fundamentals(holdings_stocks)
@@ -380,15 +428,36 @@ def main():
     else:
         msg1 += "🌐 매집 신호: 없음\n"
 
+    # 키움 계좌 요약 (있으면 추가)
+    if kw_balance:
+        kw_total = kw_balance.get("tot_eval", 0)
+        kw_pl = kw_balance.get("tot_pl", 0)
+        kw_pl_pct = kw_balance.get("tot_pl_pct", 0)
+        env_label = "모의" if os.environ.get("KIWOOM_BASE", "mock") == "mock" else "실전"
+        msg1 += f"\n💰 키움 계좌 ({env_label})\n"
+        msg1 += f"예수금  {kw_deposit:>14,}원\n"
+        msg1 += f"평가금  {kw_total:>14,}원\n"
+        msg1 += f"평가손익 {kw_pl:>+13,}원 ({kw_pl_pct:+.2f}%)\n"
+
     # ===== Msg 2: 보유 종목 (간결) =====
     msg2 = "💼 보유 종목 진단\n━━━━━━━━━━━━━\n"
+    if not holdings_stocks:
+        msg2 += "\n보유 종목 없음 (키움 모의 계좌 + HOLDINGS_JSON 모두 빈 상태)\n"
     for s in sorted(holdings_stocks, key=lambda x: 0 if "풀매도" in x.get("action","") else 1):
         cur = f"${s['price']:,.2f}" if not s["sym"].endswith(".KS") else f"{s['price']:,.0f}원"
         chg = s.get("change_pct") or 0
         w = s.get("weekly") or {}
-        msg2 += f"\n{s['action']}\n"
-        msg2 += f"{s['name']} ({s['sym']}) {s['qty']}주\n"
+        src = " 🟢키움" if s.get("_from_kiwoom") else ""
+        msg2 += f"\n{s['action']}{src}\n"
+        msg2 += f"{s['name']} ({s['sym'].replace('.KS','')}) {s['qty']}주\n"
         msg2 += f"가격 {cur} ({chg:+.2f}%) | 점수 {s['score']:.0f}/100\n"
+        if s.get("avg_price"):
+            avg = s["avg_price"]
+            avg_str = f"${avg:,.2f}" if not s["sym"].endswith(".KS") else f"{avg:,.0f}원"
+            msg2 += f"평균단가 {avg_str}"
+            if s.get("kw_pl_pct") is not None:
+                msg2 += f" | 손익 {s['kw_pl_pct']:+.2f}%"
+            msg2 += "\n"
         if w:
             msg2 += f"주봉 활성: {w['active']} | 30주선 {'위' if w['above_30'] else '아래'}\n"
         if s.get("upside") is not None:
@@ -399,4 +468,42 @@ def main():
     msg3 += "\n🇰🇷 한국 TOP 3\n"
     for i, s in enumerate(kr_top, 1):
         u = s.get("upside")
-        w = s.g
+        w = s.get("weekly", {})
+        msg3 += f"{i}. {s['sig']} {s['name']}({s['sym']}) {s['price']:,.0f}원\n"
+        msg3 += f"   점수 {s['score']:.0f}"
+        if u is not None: msg3 += f" | 여력 {u:+.0f}%"
+        if w: msg3 += f" | 활성 {w['active']}"
+        msg3 += "\n"
+    msg3 += "\n🇺🇸 미국 TOP 3\n"
+    for i, s in enumerate(us_top, 1):
+        u = s.get("upside")
+        w = s.get("weekly", {})
+        msg3 += f"{i}. {s['sig']} {s['name']}({s['sym']}) ${s['price']:,.2f}\n"
+        msg3 += f"   점수 {s['score']:.0f}"
+        if u is not None: msg3 += f" | 여력 {u:+.0f}%"
+        if w: msg3 += f" | 활성 {w['active']}"
+        msg3 += "\n"
+    # 제외된 종목 표시 (30주선 이탈)
+    if kr_excluded or us_excluded:
+        msg3 += "\n🚫 제외 (30주선 아래 = 매수 부적합)\n"
+        for s in kr_excluded + us_excluded:
+            w = s.get("weekly") or {}
+            note = "완전이탈" if w.get("full_break_30") else "30주선아래"
+            cur = f"${s['price']:,.2f}" if not s["sym"].endswith(".KS") else f"{s['price']:,.0f}원"
+            msg3 += f"   {s['name']}({s['sym']}) {cur} - {note}\n"
+
+    # ===== Msg 4: AI 종합 =====
+    msg4 = (
+        f"🤖 AI 종합 분석\n━━━━━━━━━━━━━\n\n{ai_text[:3500]}"
+    )
+
+    msgs = [msg1, msg2, msg3, msg4]
+    for i, m in enumerate(msgs, 1):
+        ok = tg_send(m)
+        print(f"  Msg {i}/4: {'OK' if ok else 'FAIL'}")
+        time.sleep(1)
+    print(f"[완료] {NOW}")
+
+
+if __name__ == "__main__":
+    main()
