@@ -2,8 +2,9 @@ name: Daily Brief
 
 on:
   schedule:
-    # 매일 KST 07:00 = UTC 22:00 (전날)
+    # KST 07:00 = UTC 22:00 (전날) / KST 17:00 = UTC 08:00
     - cron: "0 22 * * *"
+    - cron: "0 8 * * *"
   workflow_dispatch: # 수동 실행 버튼
 
 jobs:
@@ -26,4 +27,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           HOLDINGS_JSON: ${{ secrets.HOLDINGS_JSON }}
-        run: python scripts/daily_brief.py
+          KIWOOM_APPKEY: ${{ secrets.KIWOOM_APPKEY }}
+          KIWOOM_APPSECRET: ${{ secrets.KIWOOM_APPSECRET }}
+          KIWOOM_ACCOUNT: ${{ secrets.KIWOOM_ACCOUNT }}
+          KIWOOM_BASE: ${{ secrets.KIWOOM_BASE }}
+        working-directory: scripts
+        run: python daily_brief.py
