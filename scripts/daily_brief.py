@@ -1,4 +1,4 @@
-"""Daily Brief v9.1 - ROE 최우선 + 100% 검증된 데이터만 발송"""
+"""Daily Brief v9.2 - ROE + 가치투자 4지표(PBR/PSR/PEG/부채) + 절대 손실 방지"""
 import os, re, time, json as jsonlib, requests
 import yfinance as yf
 import pandas as pd
@@ -104,6 +104,18 @@ def fetch_prices(stocks):
     return out
 
 
+def value_check(s):
+    """가치투자 4지표 카운트. 만족 = 1, 미만족/데이터 없음 = 0."""
+    pbr_ok = bool(s.get("pb") and 0 < s["pb"] < 1)
+    psr_ok = bool(s.get("psr") and 0 < s["psr"] < 1)
+    peg_ok = bool(s.get("peg") and 0 < s["peg"] < 1)
+    debt_ok = bool(s.get("debt_ratio") is not None and s["debt_ratio"] < 100)  # D/E 100% 미만 = 부채<자본
+    return {
+        "pbr": pbr_ok, "psr": psr_ok, "peg": peg_ok, "debt": debt_ok,
+        "count": int(pbr_ok) + int(psr_ok) + int(peg_ok) + int(debt_ok),
+    }
+
+
 def fetch_fundamentals(stocks):
     for s in stocks:
         try:
@@ -113,7 +125,9 @@ def fetch_fundamentals(stocks):
             s["pe"] = info.get("trailingPE")
             s["fwd_pe"] = info.get("forwardPE")
             s["pb"] = info.get("priceToBook")
-            s["peg"] = info.get("pegRatio")
+            s["psr"] = info.get("priceToSalesTrailing12Months")
+            s["peg"] = info.get("pegRatio") or info.get("trailingPegRatio")
+            s["debt_ratio"] = info.get("debtToEquity")  # % 단위
             s["eps_q_growth"] = info.get("earningsQuarterlyGrowth")
             s["target_mean"] = info.get("targetMeanPrice")
             s["recommend"] = info.get("recommendationKey")
@@ -128,15 +142,19 @@ def fetch_fundamentals(stocks):
             avg_vol = info.get("averageVolume")
             cur_vol = info.get("regularMarketVolume") or info.get("volume")
             s["vol_ratio"] = (cur_vol / avg_vol) if avg_vol and cur_vol else None
-            # 데이터 검증 플래그: 핵심 지표 모두 있어야 verified
+            s["value"] = value_check(s)
+            # 검증: ROE+PE+200일선+PBR+부채비율 모두 있어야 verified
             s["verified"] = bool(
                 s.get("roe") is not None
                 and s.get("pe") and s["pe"] > 0
+                and s.get("pb") and s["pb"] > 0
                 and s.get("ma200")
+                and s.get("debt_ratio") is not None
                 and s.get("price")
             )
         except Exception:
             s["verified"] = False
+            s["value"] = {"pbr": False, "psr": False, "peg": False, "debt": False, "count": 0}
         time.sleep(0.15)
     return stocks
 
@@ -159,17 +177,14 @@ def holding_action_v9(s):
 
 
 def score_stock(s):
-    """v9.1: ROE 가중치 20점으로 강화 (워런 버핏 1순위)."""
+    """v9.2: ROE 20점 + 가치 4지표 20점 + 추세 25점 + 컨센 20점 + 모멘텀 15점."""
     score = 0
-    # 펀더 (45점) - ROE 강조
+    # ROE (20점)
     roe_pct = (s.get("roe") or 0) * 100
-    score += min(max(roe_pct, 0) / 25 * 20, 20)  # ROE 25%면 만점 20점
-    pe = s.get("pe")
-    if pe and 0 < pe < 50: score += max(min(20 - pe, 10), 0)
-    pb = s.get("pb")
-    if pb and 0 < pb < 5: score += max(min(2 - pb + 0.5, 5), 0)
-    eps_g = (s.get("eps_q_growth") or 0) * 100
-    score += min(max(eps_g, 0) / 50 * 10, 10)
+    score += min(max(roe_pct, 0) / 25 * 20, 20)
+    # 가치투자 4지표 (20점, 각 5점)
+    v = s.get("value") or {}
+    score += sum([5 if v.get(k) else 0 for k in ["pbr", "psr", "peg", "debt"]])
     # 수급/기술 (25점)
     if s.get("above_50d"): score += 8
     if s.get("above_200d"): score += 10
@@ -182,7 +197,9 @@ def score_stock(s):
     score += {"strong_buy": 10, "buy": 8, "hold": 5, "sell": 2, "strong_sell": 0}.get(rec, 5)
     upside = s.get("upside") or 0
     score += min(max(upside, 0) / 30 * 10, 10)
-    # 모멘텀 (10점)
+    # 모멘텀 + 성장 (15점)
+    eps_g = (s.get("eps_q_growth") or 0) * 100
+    score += min(max(eps_g, 0) / 50 * 5, 5)
     chg = s.get("change_pct") or 0
     if chg > 0: score += min(chg / 5 * 10, 10)
     elif chg > -2: score += 3
@@ -212,6 +229,18 @@ def detect_accumulation(ind):
     if vix >= 5 and sp500 <= -1:
         sigs.append("⚠️ 위험회피")
     return sigs
+
+
+def macro_risk(ind):
+    """거시 환경 위험 체크. 위험 시 추천 보류 권고."""
+    vix = (ind.get("VIX") or {}).get("price") or 0
+    us10y_chg = (ind.get("US10Y") or {}).get("change_pct") or 0
+    risks = []
+    if vix >= 30:
+        risks.append(f"⚠️ VIX {vix:.1f} 공포 구간 (30+)")
+    if us10y_chg >= 3:
+        risks.append(f"⚠️ US10Y 급등 {us10y_chg:+.2f}% (성장주 위험)")
+    return risks
 
 
 def fetch_news():
@@ -280,21 +309,26 @@ def tg_send(text):
 
 
 def fmt_line(i, s, kr=True):
-    """v9.1: ROE 최상단 배치, 검증된 데이터만 표시."""
+    """v9.2: ROE + 가치 4지표 카운트 + 4지표 모두 표시."""
     price_str = f"{s['price']:,.0f}원" if kr else f"${s['price']:,.2f}"
     line = f"{i}. {s['sig']} {s['name']}({s['sym']}) {price_str}\n"
-    # ROE 강조 (최상단)
-    line += f"   ⭐ ROE {s['roe']*100:.1f}% | 점수 {s['score']:.0f}\n"
-    extras = []
-    if s.get("pe") and s["pe"] > 0: extras.append(f"PE {s['pe']:.1f}")
-    if s.get("pb") and s["pb"] > 0: extras.append(f"PB {s['pb']:.1f}")
-    if s.get("upside") is not None: extras.append(f"여력 {s['upside']:+.0f}%")
-    if extras: line += f"   {' | '.join(extras)}\n"
+    line += f"   ⭐ ROE {s['roe']*100:.1f}% | 점수 {s['score']:.0f} | 가치 {s['value']['count']}/4\n"
+    # 4지표 + PE
+    parts = []
+    if s.get("pe") and s["pe"] > 0: parts.append(f"PE {s['pe']:.1f}")
+    if s.get("pb") and s["pb"] > 0: parts.append(f"PBR {s['pb']:.1f}{'✓' if s['value']['pbr'] else ''}")
+    if s.get("psr") and s["psr"] > 0: parts.append(f"PSR {s['psr']:.1f}{'✓' if s['value']['psr'] else ''}")
+    if s.get("peg") and s["peg"] > 0: parts.append(f"PEG {s['peg']:.1f}{'✓' if s['value']['peg'] else ''}")
+    if s.get("debt_ratio") is not None:
+        parts.append(f"부채 {s['debt_ratio']:.0f}%{'✓' if s['value']['debt'] else ''}")
+    if parts: line += f"   {' | '.join(parts)}\n"
+    if s.get("upside") is not None:
+        line += f"   여력 {s['upside']:+.0f}% | 추세 {'200↑' if s['above_200d'] else '200↓'}/{'50↑' if s['above_50d'] else '50↓'}\n"
     return line
 
 
 def main():
-    print(f"[{NOW}] Daily Brief v9.1 - {SESSION}")
+    print(f"[{NOW}] Daily Brief v9.2 - {SESSION}")
     ind = fetch_indices()
     kr = fetch_fundamentals(fetch_prices(KR_STOCKS))
     us = fetch_fundamentals(fetch_prices(US_STOCKS))
@@ -338,57 +372,51 @@ def main():
     for s in holdings_stocks:
         s["action"] = holding_action_v9(s)
 
-    # v9.1: 100% 검증된 데이터만 후보 (verified=True + ROE 10%+ + 200일선 위)
+    # v9.2: 절대 손실 방지 필터 - verified + ROE 10%+ + 200일선 + 부채<200%
     def is_quality(s):
         return (s.get("verified")
                 and s.get("above_200d")
-                and (s.get("roe") or 0) * 100 >= 10)
+                and (s.get("roe") or 0) * 100 >= 10
+                and (s.get("debt_ratio") or 999) < 200)  # 부채비율 200% 미만 = 안전선
     kr_cand = sorted(kr, key=lambda x: x["score"], reverse=True)
     us_cand = sorted(us, key=lambda x: x["score"], reverse=True)
     kr_top = [s for s in kr_cand if is_quality(s)][:5]
     us_top = [s for s in us_cand if is_quality(s)][:5]
-    kr_excl_reasons = []
-    for s in kr_cand:
-        if s in kr_top: continue
-        if not s.get("verified"): r = "데이터부족"
-        elif not s.get("above_200d"): r = "200일선아래"
-        elif (s.get("roe") or 0) * 100 < 10: r = f"ROE {(s.get('roe') or 0)*100:.1f}% (10%미만)"
-        else: continue
-        kr_excl_reasons.append((s, r))
-        if len(kr_excl_reasons) >= 4: break
-    us_excl_reasons = []
-    for s in us_cand:
-        if s in us_top: continue
-        if not s.get("verified"): r = "데이터부족"
-        elif not s.get("above_200d"): r = "200일선아래"
-        elif (s.get("roe") or 0) * 100 < 10: r = f"ROE {(s.get('roe') or 0)*100:.1f}% (10%미만)"
-        else: continue
-        us_excl_reasons.append((s, r))
-        if len(us_excl_reasons) >= 4: break
+
+    def excl_reason(s):
+        if not s.get("verified"): return "데이터 부족"
+        if not s.get("above_200d"): return "200일선 아래 (추세 이탈)"
+        if (s.get("roe") or 0) * 100 < 10: return f"ROE {(s.get('roe') or 0)*100:.1f}% (10% 미만)"
+        if (s.get("debt_ratio") or 999) >= 200: return f"부채비율 {s.get('debt_ratio'):.0f}% (200% 이상)"
+        return None
+    kr_excl = [(s, excl_reason(s)) for s in kr_cand if s not in kr_top and excl_reason(s)][:4]
+    us_excl = [(s, excl_reason(s)) for s in us_cand if s not in us_top and excl_reason(s)][:4]
 
     accum = detect_accumulation(ind)
+    risks = macro_risk(ind)
     news = fetch_news()
 
     holdings_brief = " | ".join(
         f"{s['name']}({(s.get('action','') or '').split()[0]} 점{s['score']:.0f})"
         for s in holdings_stocks[:8]) if holdings_stocks else "없음"
     ai_prompt = (
-        f"한미 주식 분석 ({TODAY} {SESSION}). 추측 금지, 사실만.\n"
+        f"한미 주식 분석 ({TODAY} {SESSION}). 추측 금지, 사실만, 손실 방지 우선.\n"
         f"거시: KOSPI {ind['KOSPI']['price']:.2f}({ind['KOSPI']['change_pct']:+.2f}%), "
         f"SP500 {ind['SP500']['price']:.2f}({ind['SP500']['change_pct']:+.2f}%), "
         f"USDKRW {ind['USDKRW']['price']:.2f}, US10Y {ind['US10Y']['price']:.2f}%, "
         f"VIX {ind['VIX']['price']:.2f}\n"
         f"매집신호: {' / '.join(accum) if accum else '없음'}\n"
+        f"거시리스크: {' / '.join(risks) if risks else '없음'}\n"
         f"보유: {holdings_brief}\n"
-        f"한국TOP5: " + ", ".join(f"{s['name']}(ROE{s['roe']*100:.0f}% 점{s['score']:.0f})" for s in kr_top) + "\n"
-        f"미국TOP5: " + ", ".join(f"{s['name']}(ROE{s['roe']*100:.0f}% 점{s['score']:.0f})" for s in us_top) + "\n"
+        f"한국TOP5: " + ", ".join(f"{s['name']}(ROE{s['roe']*100:.0f}% 가치{s['value']['count']}/4 점{s['score']:.0f})" for s in kr_top) + "\n"
+        f"미국TOP5: " + ", ".join(f"{s['name']}(ROE{s['roe']*100:.0f}% 가치{s['value']['count']}/4 점{s['score']:.0f})" for s in us_top) + "\n"
         f"뉴스: " + " | ".join(news[:10]) + "\n\n"
-        "출력 (800자 이내, ROE 우선 언급):\n"
+        "출력 (800자 이내, 손실 방지 우선):\n"
         "📊 시장 한줄 (거시)\n"
         "💼 보유 종목 액션\n"
-        "🇰🇷 한국 1픽 + ROE/PE 근거\n"
-        "🇺🇸 미국 1픽 + ROE/PE 근거\n"
-        "⚠️ 리스크\n"
+        "🇰🇷 한국 1픽 + ROE/PBR/부채 근거\n"
+        "🇺🇸 미국 1픽 + ROE/PBR/부채 근거\n"
+        "⚠️ 리스크 (구체적)\n"
         "🔮 다음 흐름"
     )
     ai_text = best_ai(ai_prompt)
@@ -406,6 +434,8 @@ def main():
         f"WTI     ${ind['WTI']['price']:>9,.2f}  {ind['WTI']['change_pct']:+.2f}%\n\n"
     )
     msg1 += "🌐 매집 신호\n" + "\n".join(accum) + "\n" if accum else "🌐 매집 신호: 없음\n"
+    if risks:
+        msg1 += "\n🚨 거시 리스크 (신규 매수 보수적)\n" + "\n".join(risks) + "\n"
     if kw_balance:
         env_label = "모의" if os.environ.get("KIWOOM_BASE", "mock") == "mock" else "실전"
         msg1 += f"\n💰 키움 계좌 ({env_label})\n"
@@ -430,13 +460,19 @@ def main():
             if s.get("kw_pl_pct") is not None:
                 msg2 += f" | 손익 {s['kw_pl_pct']:+.2f}%"
             msg2 += "\n"
-        # ROE 강조 (있을 때만)
         if s.get("roe") is not None:
-            msg2 += f"⭐ ROE {s['roe']*100:+.1f}%\n"
-        fund = []
-        if s.get("pe") and s["pe"] > 0: fund.append(f"PE {s['pe']:.1f}")
-        if s.get("pb") and s["pb"] > 0: fund.append(f"PB {s['pb']:.1f}")
-        if fund: msg2 += "펀더 " + " | ".join(fund) + "\n"
+            msg2 += f"⭐ ROE {s['roe']*100:+.1f}%"
+            v = s.get("value") or {}
+            if v.get("count") is not None:
+                msg2 += f" | 가치 {v['count']}/4"
+            msg2 += "\n"
+        parts = []
+        if s.get("pe") and s["pe"] > 0: parts.append(f"PE {s['pe']:.1f}")
+        if s.get("pb") and s["pb"] > 0: parts.append(f"PBR {s['pb']:.1f}")
+        if s.get("psr") and s["psr"] > 0: parts.append(f"PSR {s['psr']:.1f}")
+        if s.get("peg") and s["peg"] > 0: parts.append(f"PEG {s['peg']:.1f}")
+        if s.get("debt_ratio") is not None: parts.append(f"부채 {s['debt_ratio']:.0f}%")
+        if parts: msg2 += " | ".join(parts) + "\n"
         trend = []
         if s.get("above_50d") is not None:
             trend.append(f"50일선 {'위' if s['above_50d'] else '아래'}")
@@ -446,22 +482,24 @@ def main():
         if s.get("upside") is not None:
             msg2 += f"애널 목표가 여력 {s['upside']:+.0f}%\n"
 
-    msg3 = "🎯 신규 매수 후보 (검증완료: ROE 10%+ & 200일선 위 & 데이터검증)\n━━━━━━━━━━━━━\n\n🇰🇷 한국 TOP 5\n"
+    msg3 = "🎯 신규 매수 후보 (절대 검증)\n"
+    msg3 += "조건: ROE 10%+ & 부채 200%- & 200일선 위 & 데이터 검증\n━━━━━━━━━━━━━\n\n🇰🇷 한국 TOP 5\n"
     if kr_top:
         for i, s in enumerate(kr_top, 1):
             msg3 += fmt_line(i, s, kr=True)
     else:
-        msg3 += "조건 충족 종목 없음\n"
+        msg3 += "조건 충족 종목 없음 (보수적 기다림)\n"
     msg3 += "\n🇺🇸 미국 TOP 5\n"
     if us_top:
         for i, s in enumerate(us_top, 1):
             msg3 += fmt_line(i, s, kr=False)
     else:
         msg3 += "조건 충족 종목 없음\n"
-    if kr_excl_reasons or us_excl_reasons:
+    if kr_excl or us_excl:
         msg3 += "\n🚫 제외 (사유)\n"
-        for s, reason in (kr_excl_reasons + us_excl_reasons)[:6]:
-            msg3 += f"  {s['name']}({s['sym']}) - {reason}\n"
+        for s, r in (kr_excl + us_excl)[:6]:
+            msg3 += f"  {s['name']}({s['sym']}) - {r}\n"
+    msg3 += "\n📌 가치✓ = 4지표(PBR/PSR/PEG/부채) 통과\n"
 
     msg4 = f"🤖 AI 종합 분석\n━━━━━━━━━━━━━\n\n{ai_text[:3500]}"
 
