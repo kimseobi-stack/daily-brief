@@ -1,0 +1,28 @@
+name: Auto Trade (Mock)
+
+on:
+  schedule:
+    # KST 09:00~15:30 = UTC 00:00~06:30, 5분 간격
+    - cron: "*/5 0-6 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install requests yfinance pandas numpy
+      - name: Run auto trade
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KIWOOM_APPKEY: ${{ secrets.KIWOOM_APPKEY }}
+          KIWOOM_APPSECRET: ${{ secrets.KIWOOM_APPSECRET }}
+          KIWOOM_ACCOUNT: ${{ secrets.KIWOOM_ACCOUNT }}
+          KIWOOM_BASE: mock
+        working-directory: scripts
+        run: python auto_trade.py
