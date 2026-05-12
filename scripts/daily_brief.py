@@ -1,4 +1,4 @@
-"""Daily Brief v9 - 펀더(ROE/PE/PB) + 50/200일선 + 거래량 + 거시 통합"""
+"""Daily Brief v9.1 - ROE 최우선 + 100% 검증된 데이터만 발송"""
 import os, re, time, json as jsonlib, requests
 import yfinance as yf
 import pandas as pd
@@ -128,8 +128,15 @@ def fetch_fundamentals(stocks):
             avg_vol = info.get("averageVolume")
             cur_vol = info.get("regularMarketVolume") or info.get("volume")
             s["vol_ratio"] = (cur_vol / avg_vol) if avg_vol and cur_vol else None
+            # 데이터 검증 플래그: 핵심 지표 모두 있어야 verified
+            s["verified"] = bool(
+                s.get("roe") is not None
+                and s.get("pe") and s["pe"] > 0
+                and s.get("ma200")
+                and s.get("price")
+            )
         except Exception:
-            pass
+            s["verified"] = False
         time.sleep(0.15)
     return stocks
 
@@ -152,25 +159,30 @@ def holding_action_v9(s):
 
 
 def score_stock(s):
+    """v9.1: ROE 가중치 20점으로 강화 (워런 버핏 1순위)."""
     score = 0
-    roe = (s.get("roe") or 0) * 100
-    score += min(max(roe, 0) / 30 * 15, 15)
+    # 펀더 (45점) - ROE 강조
+    roe_pct = (s.get("roe") or 0) * 100
+    score += min(max(roe_pct, 0) / 25 * 20, 20)  # ROE 25%면 만점 20점
     pe = s.get("pe")
     if pe and 0 < pe < 50: score += max(min(20 - pe, 10), 0)
     pb = s.get("pb")
     if pb and 0 < pb < 5: score += max(min(2 - pb + 0.5, 5), 0)
     eps_g = (s.get("eps_q_growth") or 0) * 100
     score += min(max(eps_g, 0) / 50 * 10, 10)
-    if s.get("above_50d"): score += 10
+    # 수급/기술 (25점)
+    if s.get("above_50d"): score += 8
     if s.get("above_200d"): score += 10
     vr = s.get("vol_ratio") or 1.0
-    if vr >= 1.5: score += 10
-    elif vr >= 1.2: score += 7
-    elif vr >= 1.0: score += 4
+    if vr >= 1.5: score += 7
+    elif vr >= 1.2: score += 5
+    elif vr >= 1.0: score += 3
+    # 컨센서스 (20점)
     rec = s.get("recommend") or ""
     score += {"strong_buy": 10, "buy": 8, "hold": 5, "sell": 2, "strong_sell": 0}.get(rec, 5)
     upside = s.get("upside") or 0
     score += min(max(upside, 0) / 30 * 10, 10)
+    # 모멘텀 (10점)
     chg = s.get("change_pct") or 0
     if chg > 0: score += min(chg / 5 * 10, 10)
     elif chg > -2: score += 3
@@ -268,18 +280,21 @@ def tg_send(text):
 
 
 def fmt_line(i, s, kr=True):
+    """v9.1: ROE 최상단 배치, 검증된 데이터만 표시."""
     price_str = f"{s['price']:,.0f}원" if kr else f"${s['price']:,.2f}"
     line = f"{i}. {s['sig']} {s['name']}({s['sym']}) {price_str}\n"
-    line += f"   점수 {s['score']:.0f}"
-    if s.get("upside") is not None: line += f" | 여력 {s['upside']:+.0f}%"
-    if s.get("roe") is not None: line += f" | ROE {s['roe']*100:.1f}%"
-    if s.get("pe") and s["pe"] > 0: line += f" | PE {s['pe']:.1f}"
-    line += "\n"
+    # ROE 강조 (최상단)
+    line += f"   ⭐ ROE {s['roe']*100:.1f}% | 점수 {s['score']:.0f}\n"
+    extras = []
+    if s.get("pe") and s["pe"] > 0: extras.append(f"PE {s['pe']:.1f}")
+    if s.get("pb") and s["pb"] > 0: extras.append(f"PB {s['pb']:.1f}")
+    if s.get("upside") is not None: extras.append(f"여력 {s['upside']:+.0f}%")
+    if extras: line += f"   {' | '.join(extras)}\n"
     return line
 
 
 def main():
-    print(f"[{NOW}] Daily Brief v9 - {SESSION}")
+    print(f"[{NOW}] Daily Brief v9.1 - {SESSION}")
     ind = fetch_indices()
     kr = fetch_fundamentals(fetch_prices(KR_STOCKS))
     us = fetch_fundamentals(fetch_prices(US_STOCKS))
@@ -323,12 +338,33 @@ def main():
     for s in holdings_stocks:
         s["action"] = holding_action_v9(s)
 
+    # v9.1: 100% 검증된 데이터만 후보 (verified=True + ROE 10%+ + 200일선 위)
+    def is_quality(s):
+        return (s.get("verified")
+                and s.get("above_200d")
+                and (s.get("roe") or 0) * 100 >= 10)
     kr_cand = sorted(kr, key=lambda x: x["score"], reverse=True)
     us_cand = sorted(us, key=lambda x: x["score"], reverse=True)
-    kr_top = [s for s in kr_cand if s.get("above_200d")][:5]
-    us_top = [s for s in us_cand if s.get("above_200d")][:5]
-    kr_excl = [s for s in kr_cand if not s.get("above_200d")][:3]
-    us_excl = [s for s in us_cand if not s.get("above_200d")][:3]
+    kr_top = [s for s in kr_cand if is_quality(s)][:5]
+    us_top = [s for s in us_cand if is_quality(s)][:5]
+    kr_excl_reasons = []
+    for s in kr_cand:
+        if s in kr_top: continue
+        if not s.get("verified"): r = "데이터부족"
+        elif not s.get("above_200d"): r = "200일선아래"
+        elif (s.get("roe") or 0) * 100 < 10: r = f"ROE {(s.get('roe') or 0)*100:.1f}% (10%미만)"
+        else: continue
+        kr_excl_reasons.append((s, r))
+        if len(kr_excl_reasons) >= 4: break
+    us_excl_reasons = []
+    for s in us_cand:
+        if s in us_top: continue
+        if not s.get("verified"): r = "데이터부족"
+        elif not s.get("above_200d"): r = "200일선아래"
+        elif (s.get("roe") or 0) * 100 < 10: r = f"ROE {(s.get('roe') or 0)*100:.1f}% (10%미만)"
+        else: continue
+        us_excl_reasons.append((s, r))
+        if len(us_excl_reasons) >= 4: break
 
     accum = detect_accumulation(ind)
     news = fetch_news()
@@ -344,15 +380,15 @@ def main():
         f"VIX {ind['VIX']['price']:.2f}\n"
         f"매집신호: {' / '.join(accum) if accum else '없음'}\n"
         f"보유: {holdings_brief}\n"
-        f"한국TOP5: " + ", ".join(f"{s['name']}(점{s['score']:.0f})" for s in kr_top) + "\n"
-        f"미국TOP5: " + ", ".join(f"{s['name']}(점{s['score']:.0f})" for s in us_top) + "\n"
+        f"한국TOP5: " + ", ".join(f"{s['name']}(ROE{s['roe']*100:.0f}% 점{s['score']:.0f})" for s in kr_top) + "\n"
+        f"미국TOP5: " + ", ".join(f"{s['name']}(ROE{s['roe']*100:.0f}% 점{s['score']:.0f})" for s in us_top) + "\n"
         f"뉴스: " + " | ".join(news[:10]) + "\n\n"
-        "출력 (800자 이내):\n"
-        "📊 시장 한줄 (거시 환경)\n"
-        "💼 보유 종목 액션 (1줄)\n"
-        "🇰🇷 한국 1픽 + 매수 이유 (ROE/PE/추세)\n"
-        "🇺🇸 미국 1픽 + 매수 이유 (ROE/PE/추세)\n"
-        "⚠️ 오늘 리스크\n"
+        "출력 (800자 이내, ROE 우선 언급):\n"
+        "📊 시장 한줄 (거시)\n"
+        "💼 보유 종목 액션\n"
+        "🇰🇷 한국 1픽 + ROE/PE 근거\n"
+        "🇺🇸 미국 1픽 + ROE/PE 근거\n"
+        "⚠️ 리스크\n"
         "🔮 다음 흐름"
     )
     ai_text = best_ai(ai_prompt)
@@ -394,8 +430,10 @@ def main():
             if s.get("kw_pl_pct") is not None:
                 msg2 += f" | 손익 {s['kw_pl_pct']:+.2f}%"
             msg2 += "\n"
+        # ROE 강조 (있을 때만)
+        if s.get("roe") is not None:
+            msg2 += f"⭐ ROE {s['roe']*100:+.1f}%\n"
         fund = []
-        if s.get("roe") is not None: fund.append(f"ROE {s['roe']*100:+.1f}%")
         if s.get("pe") and s["pe"] > 0: fund.append(f"PE {s['pe']:.1f}")
         if s.get("pb") and s["pb"] > 0: fund.append(f"PB {s['pb']:.1f}")
         if fund: msg2 += "펀더 " + " | ".join(fund) + "\n"
@@ -405,22 +443,25 @@ def main():
         if s.get("above_200d") is not None:
             trend.append(f"200일선 {'위' if s['above_200d'] else '아래'}")
         if trend: msg2 += "추세 " + " | ".join(trend) + "\n"
-        if s.get("vol_ratio"):
-            msg2 += f"거래량 평균대비 x{s['vol_ratio']:.1f}\n"
         if s.get("upside") is not None:
             msg2 += f"애널 목표가 여력 {s['upside']:+.0f}%\n"
 
-    msg3 = "🎯 신규 매수 후보 (200일선 위 + 점수순)\n━━━━━━━━━━━━━\n\n🇰🇷 한국 TOP 5\n"
-    for i, s in enumerate(kr_top, 1):
-        msg3 += fmt_line(i, s, kr=True)
+    msg3 = "🎯 신규 매수 후보 (검증완료: ROE 10%+ & 200일선 위 & 데이터검증)\n━━━━━━━━━━━━━\n\n🇰🇷 한국 TOP 5\n"
+    if kr_top:
+        for i, s in enumerate(kr_top, 1):
+            msg3 += fmt_line(i, s, kr=True)
+    else:
+        msg3 += "조건 충족 종목 없음\n"
     msg3 += "\n🇺🇸 미국 TOP 5\n"
-    for i, s in enumerate(us_top, 1):
-        msg3 += fmt_line(i, s, kr=False)
-    if kr_excl or us_excl:
-        msg3 += "\n🚫 제외 (200일선 아래)\n"
-        for s in kr_excl + us_excl:
-            cur = f"${s['price']:,.2f}" if not s["sym"].endswith(".KS") else f"{s['price']:,.0f}원"
-            msg3 += f"   {s['name']}({s['sym']}) {cur}\n"
+    if us_top:
+        for i, s in enumerate(us_top, 1):
+            msg3 += fmt_line(i, s, kr=False)
+    else:
+        msg3 += "조건 충족 종목 없음\n"
+    if kr_excl_reasons or us_excl_reasons:
+        msg3 += "\n🚫 제외 (사유)\n"
+        for s, reason in (kr_excl_reasons + us_excl_reasons)[:6]:
+            msg3 += f"  {s['name']}({s['sym']}) - {reason}\n"
 
     msg4 = f"🤖 AI 종합 분석\n━━━━━━━━━━━━━\n\n{ai_text[:3500]}"
 
