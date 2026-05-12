@@ -459,7 +459,7 @@ def main():
                 msg2 += f" | 손익 {s['kw_pl_pct']:+.2f}%"
             msg2 += "\n"
         if w:
-            msg2 += f"주봉 활성: {w['active']} | 30주선 {'위' if w['above_30'] else '아래'}\n"
+            msg2 += f"30주선 {'위' if w['above_30'] else '아래'}\n"
         if s.get("upside") is not None:
             msg2 += f"애널 목표가 여력 {s['upside']:+.0f}%\n"
 
@@ -468,20 +468,16 @@ def main():
     msg3 += "\n🇰🇷 한국 TOP 3\n"
     for i, s in enumerate(kr_top, 1):
         u = s.get("upside")
-        w = s.get("weekly", {})
         msg3 += f"{i}. {s['sig']} {s['name']}({s['sym']}) {s['price']:,.0f}원\n"
         msg3 += f"   점수 {s['score']:.0f}"
         if u is not None: msg3 += f" | 여력 {u:+.0f}%"
-        if w: msg3 += f" | 활성 {w['active']}"
         msg3 += "\n"
     msg3 += "\n🇺🇸 미국 TOP 3\n"
     for i, s in enumerate(us_top, 1):
         u = s.get("upside")
-        w = s.get("weekly", {})
         msg3 += f"{i}. {s['sig']} {s['name']}({s['sym']}) ${s['price']:,.2f}\n"
         msg3 += f"   점수 {s['score']:.0f}"
         if u is not None: msg3 += f" | 여력 {u:+.0f}%"
-        if w: msg3 += f" | 활성 {w['active']}"
         msg3 += "\n"
     # 제외된 종목 표시 (30주선 이탈)
     if kr_excluded or us_excluded:
