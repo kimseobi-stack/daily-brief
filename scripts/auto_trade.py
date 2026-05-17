@@ -1,4 +1,4 @@
-"""Auto Trade v2 - 모의 한정 공격형, 점수 70+ 매수, 한국 종목만 매매."""
+"""Auto Trade v3 - 한국 60+ / 미국 70+ 별도 기준, 데이터 누락 페널티 제거."""
 import os, time, json, requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -31,7 +31,7 @@ MAX_NEW_PER_DAY = 5
 STOP_LOSS_PCT = -7.0
 PARTIAL_TAKE_1 = 15.0
 PARTIAL_TAKE_2 = 25.0
-MIN_SCORE = 70  # v2: 65→70 품질 우선
+MIN_SCORE_KR = 60   # 한국 기준 (yfinance 데이터 한계 반영)
 VIX_BLOCK = 30.0
 
 KR_POOL = [
@@ -64,10 +64,10 @@ def vix_check():
 
 
 def fundamental_score(symbol, price, chg):
-    """v9.2 점수 체계 동일: ROE 20 + 가치 20 + 추세 25 + 컨센 20 + 모멘텀 15."""
+    """데이터 누락 시 가중치 재분배. 100점 만점 정규화."""
     try:
         info = yf.Ticker(f"{symbol}.KS").info
-        roe = info.get("returnOnEquity") or 0
+        roe = info.get("returnOnEquity")
         pe = info.get("trailingPE")
         pb = info.get("priceToBook")
         psr = info.get("priceToSalesTrailing12Months")
@@ -82,20 +82,32 @@ def fundamental_score(symbol, price, chg):
         above_200 = bool(ma200 and price > ma200)
         upside = (target / price - 1) * 100 if target else 0
 
-        score = 0
-        score += min(max(roe * 100, 0) / 25 * 20, 20)
-        pb_ok = bool(pb and 0 < pb < 1)
-        psr_ok = bool(psr and 0 < psr < 1)
-        peg_ok = bool(peg and 0 < peg < 1)
-        debt_ok = bool(debt is not None and debt < 100)
-        score += sum([5 if x else 0 for x in [pb_ok, psr_ok, peg_ok, debt_ok]])
-        if above_50: score += 8
-        if above_200: score += 10
-        score += {"strong_buy":10,"buy":8,"hold":5,"sell":2,"strong_sell":0}.get(rec, 5)
-        score += min(max(upside, 0) / 30 * 10, 10)
-        score += min(max(eps_g * 100, 0) / 50 * 5, 5)
-        if chg > 0: score += min(chg / 5 * 10, 10)
-        elif chg > -2: score += 3
+        # 가중치 + 점수 (데이터 있을 때만 카운트)
+        items = []  # (max_pts, earned_pts)
+        if roe is not None:
+            items.append((20, min(max(roe * 100, 0) / 25 * 20, 20)))
+        # 가치 4지표 (있는 것만)
+        val_max = 0; val_earned = 0
+        if pb is not None: val_max += 5; val_earned += (5 if 0 < pb < 1 else 0)
+        if psr is not None: val_max += 5; val_earned += (5 if 0 < psr < 1 else 0)
+        if peg is not None: val_max += 5; val_earned += (5 if 0 < peg < 1 else 0)
+        if debt is not None: val_max += 5; val_earned += (5 if debt < 100 else 0)
+        if val_max > 0: items.append((val_max, val_earned))
+        # 추세
+        if ma50 is not None: items.append((8, 8 if above_50 else 0))
+        if ma200 is not None: items.append((10, 10 if above_200 else 0))
+        # 컨센서스
+        items.append((10, {"strong_buy":10,"buy":8,"hold":5,"sell":2,"strong_sell":0}.get(rec, 5)))
+        if target: items.append((10, min(max(upside, 0) / 30 * 10, 10)))
+        if eps_g: items.append((5, min(max(eps_g * 100, 0) / 50 * 5, 5)))
+        # 모멘텀
+        mom = min(chg / 5 * 10, 10) if chg > 0 else (3 if chg > -2 else 0)
+        items.append((10, mom))
+
+        total_max = sum(m for m, _ in items)
+        total_earned = sum(e for _, e in items)
+        # 100점 만점 정규화
+        score = (total_earned / total_max * 100) if total_max > 0 else 0
         return round(min(100, max(0, score)), 1), above_200, debt, roe
     except Exception:
         return 0, False, None, None
@@ -116,7 +128,7 @@ def order(token, sym, qty, side):
 
 
 def main():
-    log = [f"🤖 Auto Trade v2 ({NOW_STR})\n━━━━━━━━━━━━━"]
+    log = [f"🤖 Auto Trade v3 ({NOW_STR})\n━━━━━━━━━━━━━"]
     actions = []
     token = kw.get_token()
     if not token:
@@ -133,7 +145,6 @@ def main():
     held_syms = {h["sym"] for h in holdings}
     log.append(f"예수금 {deposit:,}원 | 보유 {len(holdings)}/{MAX_HOLDINGS}")
 
-    # 매도 (손절/익절)
     for h in holdings:
         pl = h["pl_pct"]
         if pl <= STOP_LOSS_PCT:
@@ -150,7 +161,6 @@ def main():
             ok, _ = order(token, h["sym"], q, "sell")
             actions.append(f"🟢1차익절 {h['name']} {q}주 ({pl:+.2f}%) {'OK' if ok else 'FAIL'}")
 
-    # 매수
     if vix_ok and len(holdings) < MAX_HOLDINGS and deposit >= PER_STOCK_KRW:
         candidates = []
         for sym, name in KR_POOL:
@@ -160,7 +170,7 @@ def main():
             price = q["price"]
             chg = q.get("change_pct") or 0
             score, above_200, debt, roe = fundamental_score(sym, price, chg)
-            if score < MIN_SCORE: continue
+            if score < MIN_SCORE_KR: continue
             if not above_200: continue
             if (roe or 0) * 100 < 10: continue
             if (debt or 999) >= 200: continue
